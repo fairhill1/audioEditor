@@ -48,6 +48,7 @@ struct DragState {
     start_offset: f64,
     start_x: f64,
     start_y: f64,
+    source_track_idx: usize,  // track the clip originally lived on
     current_track_idx: usize,
     active: bool, // becomes true once cursor moves past threshold
 }
@@ -1108,25 +1109,46 @@ impl ApplicationHandler for App {
             }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed
+                    && event.physical_key == PhysicalKey::Code(KeyCode::KeyT)
+                    && self.modifiers.super_key() =>
+            {
+                // Insert new empty track below the selected track (or at the end)
+                let insert_at = self.selected_track.map_or(self.tracks.len(), |i| i + 1);
+                self.tracks.insert(insert_at, audio::Track { clips: vec![] });
+                self.selected_track = Some(insert_at);
+                self.selected_clip = None;
+                self.rebuild_player();
+                self.update_title();
+                self.window.as_ref().unwrap().request_redraw();
+            }
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
                     && event.physical_key == PhysicalKey::Code(KeyCode::Backspace)
                     && !self.tracks.is_empty() =>
             {
-                if let Some(idx) = self.selected_track {
-                    self.tracks.remove(idx);
-                    // Fix selection
-                    if self.tracks.is_empty() {
-                        self.selected_track = None;
-                        self.selected_clip = None;
-                    } else {
-                        self.selected_track = Some(idx.min(self.tracks.len() - 1));
-                        self.selected_clip = None;
+                if let (Some(track_idx), Some(clip_idx)) = (self.selected_track, self.selected_clip) {
+                    if track_idx < self.tracks.len() && clip_idx < self.tracks[track_idx].clips.len() {
+                        self.tracks[track_idx].clips.remove(clip_idx);
+                        // Remove track if it's now empty
+                        if self.tracks[track_idx].clips.is_empty() {
+                            self.tracks.remove(track_idx);
+                            if self.tracks.is_empty() {
+                                self.selected_track = None;
+                                self.selected_clip = None;
+                            } else {
+                                self.selected_track = Some(track_idx.min(self.tracks.len() - 1));
+                                self.selected_clip = None;
+                            }
+                        } else {
+                            // Select previous clip or first clip
+                            self.selected_clip = Some(clip_idx.min(self.tracks[track_idx].clips.len() - 1));
+                        }
+                        self.view_start = 0.0;
+                        self.view_duration = self.max_duration();
+                        self.rebuild_player();
+                        self.update_title();
+                        self.window.as_ref().unwrap().request_redraw();
                     }
-                    // Reset view to fit remaining tracks
-                    self.view_start = 0.0;
-                    self.view_duration = self.max_duration();
-                    self.rebuild_player();
-                    self.update_title();
-                    self.window.as_ref().unwrap().request_redraw();
                 }
             }
             WindowEvent::KeyboardInput { event, .. }
@@ -1239,6 +1261,7 @@ impl ApplicationHandler for App {
                         start_offset: clip.offset_secs,
                         start_x: self.cursor_x,
                         start_y: self.cursor_y,
+                        source_track_idx: track_idx,
                         current_track_idx: track_idx,
                         active: false,
                     });
@@ -1270,9 +1293,25 @@ impl ApplicationHandler for App {
             } => {
                 if let Some(drag) = self.dragging.take() {
                     if drag.active {
-                        self.selected_track = Some(drag.current_track_idx);
-                        self.selected_clip = Some(drag.clip_idx);
+                        let mut sel_track = drag.current_track_idx;
+                        let sel_clip = drag.clip_idx;
+                        // Remove the source track only if the drag emptied it
+                        let src = drag.source_track_idx;
+                        if src < self.tracks.len() && self.tracks[src].clips.is_empty() {
+                            self.tracks.remove(src);
+                            if src < sel_track {
+                                sel_track -= 1;
+                            }
+                        }
+                        if self.tracks.is_empty() {
+                            self.selected_track = None;
+                            self.selected_clip = None;
+                        } else {
+                            self.selected_track = Some(sel_track);
+                            self.selected_clip = Some(sel_clip);
+                        }
                         self.rebuild_player();
+                        self.update_title();
                     }
                     self.window.as_ref().unwrap().request_redraw();
                 }
