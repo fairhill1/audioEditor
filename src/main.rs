@@ -962,7 +962,10 @@ impl App {
             return;
         };
         match project::save_project(&path, &self.tracks, self.project_rate) {
-            Ok(()) => self.update_title(),
+            Ok(()) => {
+                self.undo_manager.mark_saved();
+                self.update_title();
+            }
             Err(e) => eprintln!("Failed to save project: {e}"),
         }
     }
@@ -976,7 +979,10 @@ impl App {
         if let Some(file) = file {
             self.project_path = Some(file.clone());
             match project::save_project(&file, &self.tracks, self.project_rate) {
-                Ok(()) => self.update_title(),
+                Ok(()) => {
+                    self.undo_manager.mark_saved();
+                    self.update_title();
+                }
                 Err(e) => eprintln!("Failed to save project: {e}"),
             }
         }
@@ -1004,6 +1010,7 @@ impl App {
                     self.view_start = 0.0;
                     self.view_duration = self.max_duration();
                     self.rebuild_player();
+                    self.undo_manager.mark_saved();
                     self.update_title();
                     self.window.as_ref().unwrap().request_redraw();
                 }
@@ -1082,11 +1089,12 @@ impl App {
             .and_then(|p| p.file_stem())
             .and_then(|n| n.to_str())
             .unwrap_or("Untitled");
+        let dirty = if self.undo_manager.is_dirty() { " *" } else { "" };
         let title = if self.tracks.is_empty() {
-            format!("Audio Editor — {project_name}")
+            format!("Audio Editor — {project_name}{dirty}")
         } else {
             let rate_khz = self.project_rate as f64 / 1000.0;
-            format!("Audio Editor — {project_name} — {} track(s) — {rate_khz:.1}kHz", self.tracks.len())
+            format!("Audio Editor — {project_name}{dirty} — {} track(s) — {rate_khz:.1}kHz", self.tracks.len())
         };
         self.window.as_ref().unwrap().set_title(&title);
     }

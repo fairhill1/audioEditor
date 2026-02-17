@@ -70,6 +70,7 @@ pub struct UndoManager {
     undo_stack: Vec<UndoAction>,
     redo_stack: Vec<UndoAction>,
     max_entries: usize,
+    save_point: usize,
 }
 
 impl UndoManager {
@@ -78,6 +79,7 @@ impl UndoManager {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             max_entries,
+            save_point: 0,
         }
     }
 
@@ -105,6 +107,16 @@ impl UndoManager {
         self.undo_stack.push(action);
         if self.undo_stack.len() > self.max_entries {
             self.undo_stack.remove(0);
+            // save_point was before the dropped entry — can never return to it
+            self.save_point = self.save_point.saturating_sub(1);
         }
+    }
+
+    pub fn mark_saved(&mut self) {
+        self.save_point = self.undo_stack.len();
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.undo_stack.len() != self.save_point
     }
 }
