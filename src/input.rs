@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use glyphon::Resolution;
 use winit::application::ApplicationHandler;
@@ -7,7 +7,7 @@ use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorIcon, Window, WindowId};
 
-use crate::app::{App, DragState, SelectionEdge, DRAG_THRESHOLD_PX};
+use crate::app::{App, DeferredAction, DragState, PendingDialog, SelectionEdge, DRAG_THRESHOLD_PX};
 use crate::{audio, modal, undo};
 
 impl ApplicationHandler for App {
@@ -24,8 +24,74 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        // Spawn native file dialogs on a background thread. On macOS, rfd's
+        // synchronous API runs a modal event loop via `dispatch_sync` to the
+        // main thread. By spawning from here and returning immediately, winit's
+        // `handling` flag is cleared before the dialog pumps events, avoiding
+        // the re-entrant event handler panic.
+        if let Some(action) = self.deferred_action.take() {
+            if self.pending_dialog.is_none() {
+                // SaveProject with an existing path needs no dialog.
+                if matches!(action, DeferredAction::SaveProject) && self.project_path.is_some() {
+                    self.save_project_to_existing_path();
+                } else {
+                    let result: Arc<Mutex<Option<Option<std::path::PathBuf>>>> =
+                        Arc::new(Mutex::new(None));
+                    let result_clone = result.clone();
+                    match &action {
+                        DeferredAction::OpenFile => {
+                            std::thread::spawn(move || {
+                                let file = rfd::FileDialog::new()
+                                    .add_filter("Audio", &["wav", "mp3", "flac", "ogg", "m4a", "aac"])
+                                    .pick_file();
+                                *result_clone.lock().unwrap() = Some(file);
+                            });
+                        }
+                        DeferredAction::OpenProject => {
+                            std::thread::spawn(move || {
+                                let file = rfd::FileDialog::new()
+                                    .set_title("Open Project")
+                                    .add_filter("Project", &["ron"])
+                                    .pick_file();
+                                *result_clone.lock().unwrap() = Some(file);
+                            });
+                        }
+                        DeferredAction::SaveProject | DeferredAction::SaveProjectAs => {
+                            std::thread::spawn(move || {
+                                let file = rfd::FileDialog::new()
+                                    .set_title("Save Project")
+                                    .set_file_name("project.ron")
+                                    .add_filter("Project", &["ron"])
+                                    .save_file();
+                                *result_clone.lock().unwrap() = Some(file);
+                            });
+                        }
+                    }
+                    self.pending_dialog = Some(PendingDialog { result, action });
+                }
+            }
+        }
+
+        // Poll for dialog completion.
+        if let Some(ref dialog) = self.pending_dialog {
+            let ready = dialog.result.lock().unwrap().is_some();
+            if ready {
+                let dialog = self.pending_dialog.take().unwrap();
+                let file = dialog.result.lock().unwrap().take().unwrap();
+                if let Some(path) = file {
+                    match dialog.action {
+                        DeferredAction::OpenFile => self.import_file_from_path(path),
+                        DeferredAction::OpenProject => self.open_project_from_path(path),
+                        DeferredAction::SaveProject | DeferredAction::SaveProjectAs => {
+                            self.save_project_to_path(path);
+                        }
+                    }
+                }
+            }
+        }
+
         self.poll_loading();
-        if self.loading.is_some() {
+        if self.loading.is_some() || self.pending_dialog.is_some() {
             self.window.as_ref().unwrap().request_redraw();
         } else if let Some(player) = &self.player {
             if player.is_playing() {
@@ -118,7 +184,7 @@ impl ApplicationHandler for App {
                     && event.physical_key == PhysicalKey::Code(KeyCode::KeyO)
                     && self.modifiers.super_key() =>
             {
-                self.open_project();
+                self.deferred_action = Some(DeferredAction::OpenProject);
             }
             // Cmd+I: Import audio file
             WindowEvent::KeyboardInput { event, .. }
@@ -126,7 +192,7 @@ impl ApplicationHandler for App {
                     && event.physical_key == PhysicalKey::Code(KeyCode::KeyI)
                     && self.modifiers.super_key() =>
             {
-                self.open_file();
+                self.deferred_action = Some(DeferredAction::OpenFile);
             }
             // Cmd+S: Save project
             WindowEvent::KeyboardInput { event, .. }
@@ -135,7 +201,7 @@ impl ApplicationHandler for App {
                     && self.modifiers.super_key()
                     && !self.modifiers.shift_key() =>
             {
-                self.save_project();
+                self.deferred_action = Some(DeferredAction::SaveProject);
             }
             // Cmd+Shift+S: Save project as
             WindowEvent::KeyboardInput { event, .. }
@@ -144,7 +210,7 @@ impl ApplicationHandler for App {
                     && self.modifiers.super_key()
                     && self.modifiers.shift_key() =>
             {
-                self.save_project_as();
+                self.deferred_action = Some(DeferredAction::SaveProjectAs);
             }
             // Cmd+Shift+Z: Redo
             WindowEvent::KeyboardInput { event, .. }
@@ -164,7 +230,7 @@ impl ApplicationHandler for App {
             {
                 self.perform_undo();
             }
-            // Cmd+C: Copy selected clip (or selection region)
+            // Cmd+C: Copy selected clip (or selection region across multiple clips)
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed
                     && event.physical_key == PhysicalKey::Code(KeyCode::KeyC)
@@ -173,36 +239,21 @@ impl ApplicationHandler for App {
                 if let (Some((s0, s1)), Some(track_idx)) =
                     (self.selection, self.selected_track)
                 {
-                    let clip_idx = self.selected_clip.or_else(|| {
-                        if track_idx < self.tracks.len() {
-                            self.tracks[track_idx].clips.iter().position(|c| {
-                                let c_end = c.offset_secs + c.duration_secs();
-                                s0 < c_end && s1 > c.offset_secs
-                            })
-                        } else {
-                            None
+                    if track_idx < self.tracks.len() {
+                        let copied = self.copy_region_clips(track_idx, s0, s1);
+                        if !copied.is_empty() {
+                            self.clipboard = copied;
                         }
-                    });
-                    if let Some(clip_idx) = clip_idx {
-                    // Copy selection region from clip
-                    if track_idx < self.tracks.len() && clip_idx < self.tracks[track_idx].clips.len() {
-                        let clip = &self.tracks[track_idx].clips[clip_idx];
-                        let rel_start = (s0 - clip.offset_secs).max(0.0);
-                        let rel_end = (s1 - clip.offset_secs).min(clip.duration_secs());
-                        if rel_end > rel_start {
-                            let mut sliced = clip.slice(rel_start, rel_end);
-                            sliced.offset_secs = 0.0;
-                            self.clipboard = Some(sliced);
-                        }
-                    }
                     }
                 } else if let (Some(track_idx), Some(clip_idx)) = (self.selected_track, self.selected_clip) {
                     if track_idx < self.tracks.len() && clip_idx < self.tracks[track_idx].clips.len() {
-                        self.clipboard = Some(self.tracks[track_idx].clips[clip_idx].clone());
+                        let mut c = self.tracks[track_idx].clips[clip_idx].clone();
+                        c.offset_secs = 0.0;
+                        self.clipboard = vec![c];
                     }
                 }
             }
-            // Cmd+X: Cut selected clip (or selection region)
+            // Cmd+X: Cut selected clip (or selection region across multiple clips)
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed
                     && event.physical_key == PhysicalKey::Code(KeyCode::KeyX)
@@ -211,59 +262,34 @@ impl ApplicationHandler for App {
                 if let (Some((s0, s1)), Some(track_idx)) =
                     (self.selection, self.selected_track)
                 {
-                    let clip_idx = self.selected_clip.or_else(|| {
-                        if track_idx < self.tracks.len() {
-                            self.tracks[track_idx].clips.iter().position(|c| {
-                                let c_end = c.offset_secs + c.duration_secs();
-                                s0 < c_end && s1 > c.offset_secs
-                            })
-                        } else {
-                            None
-                        }
-                    });
-                    if let Some(clip_idx) = clip_idx {
-                    if track_idx < self.tracks.len() && clip_idx < self.tracks[track_idx].clips.len() {
-                        let clip = &self.tracks[track_idx].clips[clip_idx];
-                        let rel_start = (s0 - clip.offset_secs).max(0.0);
-                        let rel_end = (s1 - clip.offset_secs).min(clip.duration_secs());
-                        if rel_end > rel_start {
+                    if track_idx < self.tracks.len() {
+                        let overlapping = self.clips_overlapping_range(track_idx, s0, s1);
+                        if !overlapping.is_empty() {
                             let prev_clipboard = self.clipboard.clone();
                             let prev_sel_clip = self.selected_clip;
-                            let original_clip = self.tracks[track_idx].clips[clip_idx].clone();
+                            let prev_selection = self.selection;
+                            let prev_clips = self.tracks[track_idx].clips.clone();
 
-                            // Copy the selection to clipboard
-                            let mut sliced = clip.slice(rel_start, rel_end);
-                            sliced.offset_secs = 0.0;
+                            // Copy region to clipboard
+                            let copied = self.copy_region_clips(track_idx, s0, s1);
+                            // Remove region from track
+                            self.remove_region_from_track(track_idx, s0, s1);
 
-                            // Remove the region — replace original clip with left + right pieces
-                            let (left, right) = clip.remove_region(rel_start, rel_end);
-                            self.tracks[track_idx].clips.remove(clip_idx);
-                            let mut insert_at = clip_idx;
-                            if let Some(l) = left {
-                                self.tracks[track_idx].clips.insert(insert_at, l);
-                                insert_at += 1;
-                            }
-                            if let Some(r) = right {
-                                self.tracks[track_idx].clips.insert(insert_at, r);
-                            }
-
-                            // Store original clip for undo — use CutClip with the whole original
-                            self.undo_manager.push(undo::UndoAction::CutClip {
-                                track_idx, clip_idx, clip: original_clip,
-                                prev_clipboard, prev_sel_clip,
+                            self.undo_manager.push(undo::UndoAction::CutRegion {
+                                track_idx, prev_clips, prev_clipboard,
+                                prev_sel_clip, prev_selection,
                             });
-                            self.clipboard = Some(sliced);
+                            self.clipboard = copied;
                             self.selection = None;
 
                             if self.tracks[track_idx].clips.is_empty() {
                                 self.selected_clip = None;
                             } else {
-                                self.selected_clip = Some(clip_idx.min(self.tracks[track_idx].clips.len() - 1));
+                                self.selected_clip = Some(0);
                             }
                             self.rebuild_player();
                             self.window.as_ref().unwrap().request_redraw();
                         }
-                    }
                     }
                 } else if let (Some(track_idx), Some(clip_idx)) = (self.selected_track, self.selected_clip) {
                     if track_idx < self.tracks.len() && clip_idx < self.tracks[track_idx].clips.len() {
@@ -274,7 +300,9 @@ impl ApplicationHandler for App {
                             track_idx, clip_idx, clip: clip.clone(),
                             prev_clipboard, prev_sel_clip,
                         });
-                        self.clipboard = Some(clip);
+                        let mut c = clip;
+                        c.offset_secs = 0.0;
+                        self.clipboard = vec![c];
                         if self.tracks[track_idx].clips.is_empty() {
                             self.selected_clip = None;
                         } else {
@@ -285,37 +313,48 @@ impl ApplicationHandler for App {
                     }
                 }
             }
-            // Cmd+V: Paste clip at playhead on selected track
+            // Cmd+V: Paste clip(s) at playhead on selected track
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed
                     && event.physical_key == PhysicalKey::Code(KeyCode::KeyV)
                     && self.modifiers.super_key() =>
             {
-                if let (Some(clip), Some(track_idx)) = (&self.clipboard, self.selected_track) {
-                    if track_idx < self.tracks.len() {
-                        let mut new_clip = clip.clone();
-                        new_clip.offset_secs = self.playhead_secs();
-                        let clip_dur = new_clip.duration_secs();
+                if !self.clipboard.is_empty() {
+                    if let Some(track_idx) = self.selected_track {
+                        if track_idx < self.tracks.len() {
+                            let playhead = self.playhead_secs();
+                            // Build new clips with offsets relative to playhead
+                            let new_clips: Vec<audio::Clip> = self.clipboard.iter().map(|c| {
+                                let mut nc = c.clone();
+                                nc.offset_secs = playhead + c.offset_secs;
+                                nc
+                            }).collect();
 
-                        // Check for overlap with existing clips
-                        let overlaps = self.tracks[track_idx].clips.iter().any(|c| {
-                            let c_start = c.offset_secs;
-                            let c_end = c_start + c.duration_secs();
-                            let n_start = new_clip.offset_secs;
-                            let n_end = n_start + clip_dur;
-                            n_start < c_end && n_end > c_start
-                        });
-
-                        if !overlaps {
-                            let prev_sel_clip = self.selected_clip;
-                            let new_idx = self.tracks[track_idx].clips.len();
-                            self.tracks[track_idx].clips.push(new_clip);
-                            self.undo_manager.push(undo::UndoAction::PasteClip {
-                                track_idx, clip_idx: new_idx, prev_sel_clip,
+                            // Check ALL new clips against ALL existing clips for overlap
+                            let overlaps = new_clips.iter().any(|nc| {
+                                let n_start = nc.offset_secs;
+                                let n_end = n_start + nc.duration_secs();
+                                self.tracks[track_idx].clips.iter().any(|c| {
+                                    let c_start = c.offset_secs;
+                                    let c_end = c_start + c.duration_secs();
+                                    n_start < c_end && n_end > c_start
+                                })
                             });
-                            self.selected_clip = Some(new_idx);
-                            self.rebuild_player();
-                            self.window.as_ref().unwrap().request_redraw();
+
+                            if !overlaps {
+                                let prev_sel_clip = self.selected_clip;
+                                let prev_clips = self.tracks[track_idx].clips.clone();
+                                for nc in new_clips {
+                                    self.tracks[track_idx].clips.push(nc);
+                                }
+                                self.undo_manager.push(undo::UndoAction::PasteClips {
+                                    track_idx, prev_clips, prev_sel_clip,
+                                });
+                                let last = self.tracks[track_idx].clips.len().saturating_sub(1);
+                                self.selected_clip = Some(last);
+                                self.rebuild_player();
+                                self.window.as_ref().unwrap().request_redraw();
+                            }
                         }
                     }
                 }
@@ -375,58 +414,30 @@ impl ApplicationHandler for App {
                 if let (Some((s0, s1)), Some(track_idx)) =
                     (self.selection, self.selected_track)
                 {
-                    // Find clip overlapping the selection if none explicitly selected
-                    let clip_idx = self.selected_clip.or_else(|| {
-                        if track_idx < self.tracks.len() {
-                            self.tracks[track_idx].clips.iter().position(|c| {
-                                let c_end = c.offset_secs + c.duration_secs();
-                                s0 < c_end && s1 > c.offset_secs
-                            })
-                        } else {
-                            None
-                        }
-                    });
-                    // Delete selected region from clip
-                    if let Some(clip_idx) = clip_idx {
-                    if track_idx < self.tracks.len() && clip_idx < self.tracks[track_idx].clips.len() {
-                        let clip = &self.tracks[track_idx].clips[clip_idx];
-                        let rel_start = (s0 - clip.offset_secs).max(0.0);
-                        let rel_end = (s1 - clip.offset_secs).min(clip.duration_secs());
-                        if rel_end > rel_start {
+                    if track_idx < self.tracks.len() {
+                        let overlapping = self.clips_overlapping_range(track_idx, s0, s1);
+                        if !overlapping.is_empty() {
                             let prev_sel_clip = self.selected_clip;
                             let prev_selection = self.selection;
-                            let original_clip = self.tracks[track_idx].clips[clip_idx].clone();
+                            let prev_clips = self.tracks[track_idx].clips.clone();
 
-                            let (left, right) = clip.remove_region(rel_start, rel_end);
-                            self.tracks[track_idx].clips.remove(clip_idx);
-                            let mut num_pieces = 0;
-                            let mut insert_at = clip_idx;
-                            if let Some(l) = left {
-                                self.tracks[track_idx].clips.insert(insert_at, l);
-                                insert_at += 1;
-                                num_pieces += 1;
-                            }
-                            if let Some(r) = right {
-                                self.tracks[track_idx].clips.insert(insert_at, r);
-                                num_pieces += 1;
-                            }
+                            self.remove_region_from_track(track_idx, s0, s1);
 
-                            self.undo_manager.push(undo::UndoAction::DeleteRegion {
-                                track_idx, clip_idx, original_clip,
-                                num_pieces, prev_sel_clip, prev_selection,
+                            self.undo_manager.push(undo::UndoAction::DeleteRegionMulti {
+                                track_idx, prev_clips,
+                                prev_sel_clip, prev_selection,
                             });
                             self.selection = None;
 
                             if self.tracks[track_idx].clips.is_empty() {
                                 self.selected_clip = None;
                             } else {
-                                self.selected_clip = Some(clip_idx.min(self.tracks[track_idx].clips.len() - 1));
+                                self.selected_clip = Some(0);
                             }
                             self.rebuild_player();
                             self.update_title();
                             self.window.as_ref().unwrap().request_redraw();
                         }
-                    }
                     }
                 } else if let (Some(track_idx), Some(clip_idx)) = (self.selected_track, self.selected_clip) {
                     // No selection — delete entire clip
@@ -582,44 +593,81 @@ impl ApplicationHandler for App {
                     let dx_secs = dx_px / config.width as f64 * view_duration;
                     let desired_offset = (self.dragging.as_ref().unwrap().start_offset + dx_secs).max(0.0);
 
-                    // Determine target track from cursor Y
-                    let lane_height = config.height as f64 / num_tracks as f64;
-                    let target_track = ((position.y / lane_height) as usize).min(num_tracks - 1);
+                    let is_group = !self.dragging.as_ref().unwrap().group.is_empty();
 
-                    let current_track = self.dragging.as_ref().unwrap().current_track_idx;
-                    let clip_idx = self.dragging.as_ref().unwrap().clip_idx;
+                    if is_group {
+                        // Group drag — move all clips together, no cross-track
+                        let drag = self.dragging.as_ref().unwrap();
+                        let track_idx = drag.current_track_idx;
+                        let group = drag.group.clone();
+                        let orig_group_left = drag.start_offset;
 
-                    // Move clip between tracks if needed
-                    let clip_idx = if target_track != current_track
-                        && current_track < self.tracks.len()
-                        && clip_idx < self.tracks[current_track].clips.len()
-                    {
-                        let clip = self.tracks[current_track].clips.remove(clip_idx);
-                        self.tracks[target_track].clips.push(clip);
-                        let new_idx = self.tracks[target_track].clips.len() - 1;
-                        let drag = self.dragging.as_mut().unwrap();
-                        drag.current_track_idx = target_track;
-                        drag.clip_idx = new_idx;
-                        self.selected_track = Some(target_track);
-                        self.selected_clip = Some(new_idx);
-                        new_idx
-                    } else {
-                        clip_idx
-                    };
+                        let group_indices: Vec<usize> = group.iter().map(|&(i, _)| i).collect();
+                        let group_orig_offsets: Vec<f64> = group.iter().map(|&(_, o)| o).collect();
 
-                    let track_idx = self.dragging.as_ref().unwrap().current_track_idx;
+                        // Compute group span (from leftmost offset to rightmost end)
+                        let group_right = group.iter().map(|&(i, o)| {
+                            o + self.tracks[track_idx].clips[i].duration_secs()
+                        }).fold(f64::MIN, f64::max);
+                        let group_span = group_right - orig_group_left;
 
-                    if track_idx < self.tracks.len() && clip_idx < self.tracks[track_idx].clips.len() {
-                        let clip_dur = self.tracks[track_idx].clips[clip_idx].duration_secs();
+                        // Snap group outer edges
+                        let snapped = self.snap_offset_group(
+                            track_idx, &group_indices, desired_offset, group_span,
+                        );
 
-                        // Snap to nearby clip edges
-                        let snapped = self.snap_offset(track_idx, clip_idx, desired_offset, clip_dur);
+                        // Clamp to prevent overlap with non-group clips
+                        let final_left = self.clamp_group_no_overlap(
+                            track_idx, &group_indices, &group_orig_offsets,
+                            snapped, orig_group_left,
+                        );
 
-                        // Prevent overlap
-                        let final_offset = self.clamp_no_overlap(track_idx, clip_idx, snapped, clip_dur);
-
-                        self.tracks[track_idx].clips[clip_idx].offset_secs = final_offset;
+                        let delta = final_left - orig_group_left;
+                        for &(ci, orig_off) in &group {
+                            self.tracks[track_idx].clips[ci].offset_secs = orig_off + delta;
+                        }
                         self.window.as_ref().unwrap().request_redraw();
+                    } else {
+                        // Single clip drag
+                        // Determine target track from cursor Y
+                        let lane_height = config.height as f64 / num_tracks as f64;
+                        let target_track = ((position.y / lane_height) as usize).min(num_tracks - 1);
+
+                        let current_track = self.dragging.as_ref().unwrap().current_track_idx;
+                        let clip_idx = self.dragging.as_ref().unwrap().clip_idx;
+
+                        // Move clip between tracks if needed
+                        let clip_idx = if target_track != current_track
+                            && current_track < self.tracks.len()
+                            && clip_idx < self.tracks[current_track].clips.len()
+                        {
+                            let clip = self.tracks[current_track].clips.remove(clip_idx);
+                            self.tracks[target_track].clips.push(clip);
+                            let new_idx = self.tracks[target_track].clips.len() - 1;
+                            let drag = self.dragging.as_mut().unwrap();
+                            drag.current_track_idx = target_track;
+                            drag.clip_idx = new_idx;
+                            self.selected_track = Some(target_track);
+                            self.selected_clip = Some(new_idx);
+                            new_idx
+                        } else {
+                            clip_idx
+                        };
+
+                        let track_idx = self.dragging.as_ref().unwrap().current_track_idx;
+
+                        if track_idx < self.tracks.len() && clip_idx < self.tracks[track_idx].clips.len() {
+                            let clip_dur = self.tracks[track_idx].clips[clip_idx].duration_secs();
+
+                            // Snap to nearby clip edges
+                            let snapped = self.snap_offset(track_idx, clip_idx, desired_offset, clip_dur);
+
+                            // Prevent overlap
+                            let final_offset = self.clamp_no_overlap(track_idx, clip_idx, snapped, clip_dur);
+
+                            self.tracks[track_idx].clips[clip_idx].offset_secs = final_offset;
+                            self.window.as_ref().unwrap().request_redraw();
+                        }
                     }
                 }
             }
@@ -629,16 +677,42 @@ impl ApplicationHandler for App {
                 ..
             } => {
                 if let Some((track_idx, clip_idx)) = self.hit_test_title_bar(self.cursor_x, self.cursor_y) {
-                    // Title bar click → prepare clip drag
-                    self.selection = None;
+                    // Title bar click → prepare clip drag (possibly group)
                     self.selecting = false;
                     self.selected_track = Some(track_idx);
                     self.selected_clip = Some(clip_idx);
 
                     let clip = &self.tracks[track_idx].clips[clip_idx];
+                    let clip_start = clip.offset_secs;
+                    let clip_end = clip_start + clip.duration_secs();
+
+                    // Check if clicked clip overlaps the active selection
+                    let group = if let Some((s0, s1)) = self.selection {
+                        if clip_start < s1 && clip_end > s0 {
+                            // Gather all clips overlapping the selection
+                            let indices = self.clips_overlapping_range(track_idx, s0, s1);
+                            indices.iter().map(|&i| {
+                                (i, self.tracks[track_idx].clips[i].offset_secs)
+                            }).collect::<Vec<_>>()
+                        } else {
+                            // Clicked outside selection — clear selection, single drag
+                            self.selection = None;
+                            Vec::new()
+                        }
+                    } else {
+                        Vec::new()
+                    };
+
+                    let start_offset = if !group.is_empty() {
+                        // Use the leftmost group clip offset as reference
+                        group.iter().map(|&(_, o)| o).fold(f64::MAX, f64::min)
+                    } else {
+                        clip.offset_secs
+                    };
+
                     self.dragging = Some(DragState {
                         clip_idx,
-                        start_offset: clip.offset_secs,
+                        start_offset,
                         start_x: self.cursor_x,
                         start_y: self.cursor_y,
                         source_track_idx: track_idx,
@@ -647,6 +721,7 @@ impl ApplicationHandler for App {
                         source_clip_idx: clip_idx,
                         prev_selected_track: self.selected_track,
                         prev_selected_clip: self.selected_clip,
+                        group,
                     });
                 } else if let Some(edge) = self.hit_test_selection_edge(self.cursor_x) {
                     // Click near selection edge → resize existing selection
@@ -711,44 +786,69 @@ impl ApplicationHandler for App {
 
                 if let Some(drag) = self.dragging.take() {
                     if drag.active {
-                        let mut sel_track = drag.current_track_idx;
-                        let sel_clip = drag.clip_idx;
-                        let dest_offset = self.tracks[sel_track].clips[sel_clip].offset_secs;
-                        // Remove the source track only if the drag emptied it
-                        let src = drag.source_track_idx;
-                        let src_track_was_removed = src < self.tracks.len() && self.tracks[src].clips.is_empty();
-                        if src_track_was_removed {
-                            self.tracks.remove(src);
-                            if src < sel_track {
-                                sel_track -= 1;
+                        if !drag.group.is_empty() {
+                            // Group drag completion
+                            let track_idx = drag.current_track_idx;
+                            let mut moves = Vec::new();
+                            for &(ci, orig_off) in &drag.group {
+                                let new_off = self.tracks[track_idx].clips[ci].offset_secs;
+                                if (new_off - orig_off).abs() > 1e-9 {
+                                    moves.push((ci, orig_off, new_off));
+                                }
                             }
-                        }
-                        // Only push undo if something actually changed
-                        let moved = drag.source_track_idx != sel_track
-                            || drag.start_offset != dest_offset
-                            || src_track_was_removed;
-                        if moved {
-                            self.undo_manager.push(undo::UndoAction::MoveClip {
-                                src_track: drag.source_track_idx,
-                                src_clip_idx: drag.source_clip_idx,
-                                src_offset: drag.start_offset,
-                                dest_track: sel_track,
-                                dest_clip_idx: sel_clip,
-                                dest_offset,
-                                src_track_was_removed,
-                                prev_sel_track: drag.prev_selected_track,
-                                prev_sel_clip: drag.prev_selected_clip,
-                            });
-                        }
-                        if self.tracks.is_empty() {
-                            self.selected_track = None;
-                            self.selected_clip = None;
+                            if !moves.is_empty() {
+                                self.undo_manager.push(undo::UndoAction::MoveClips {
+                                    track_idx,
+                                    moves,
+                                    prev_sel_track: drag.prev_selected_track,
+                                    prev_sel_clip: drag.prev_selected_clip,
+                                });
+                            }
+                            self.selected_track = Some(track_idx);
+                            self.selected_clip = Some(drag.clip_idx);
+                            self.rebuild_player();
+                            self.update_title();
                         } else {
-                            self.selected_track = Some(sel_track);
-                            self.selected_clip = Some(sel_clip);
+                            // Single clip drag completion
+                            let mut sel_track = drag.current_track_idx;
+                            let sel_clip = drag.clip_idx;
+                            let dest_offset = self.tracks[sel_track].clips[sel_clip].offset_secs;
+                            // Remove the source track only if the drag emptied it
+                            let src = drag.source_track_idx;
+                            let src_track_was_removed = src < self.tracks.len() && self.tracks[src].clips.is_empty();
+                            if src_track_was_removed {
+                                self.tracks.remove(src);
+                                if src < sel_track {
+                                    sel_track -= 1;
+                                }
+                            }
+                            // Only push undo if something actually changed
+                            let moved = drag.source_track_idx != sel_track
+                                || drag.start_offset != dest_offset
+                                || src_track_was_removed;
+                            if moved {
+                                self.undo_manager.push(undo::UndoAction::MoveClip {
+                                    src_track: drag.source_track_idx,
+                                    src_clip_idx: drag.source_clip_idx,
+                                    src_offset: drag.start_offset,
+                                    dest_track: sel_track,
+                                    dest_clip_idx: sel_clip,
+                                    dest_offset,
+                                    src_track_was_removed,
+                                    prev_sel_track: drag.prev_selected_track,
+                                    prev_sel_clip: drag.prev_selected_clip,
+                                });
+                            }
+                            if self.tracks.is_empty() {
+                                self.selected_track = None;
+                                self.selected_clip = None;
+                            } else {
+                                self.selected_track = Some(sel_track);
+                                self.selected_clip = Some(sel_clip);
+                            }
+                            self.rebuild_player();
+                            self.update_title();
                         }
-                        self.rebuild_player();
-                        self.update_title();
                     }
                     self.window.as_ref().unwrap().request_redraw();
                 }

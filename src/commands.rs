@@ -89,7 +89,7 @@ impl App {
             } => {
                 // Undo cut: re-insert the clip, restore previous clipboard
                 let cur_sel_clip = self.selected_clip;
-                let cur_clipboard = self.clipboard.take();
+                let cur_clipboard = std::mem::take(&mut self.clipboard);
                 self.tracks[track_idx].clips.insert(clip_idx, clip.clone());
                 self.clipboard = prev_clipboard;
                 self.selected_track = Some(track_idx);
@@ -98,44 +98,6 @@ impl App {
                 undo::UndoAction::CutClip {
                     track_idx, clip_idx, clip,
                     prev_clipboard: cur_clipboard,
-                    prev_sel_clip: cur_sel_clip,
-                }
-            }
-            undo::UndoAction::DeleteRegion {
-                track_idx, clip_idx, original_clip, num_pieces,
-                prev_sel_clip, prev_selection,
-            } => {
-                // Undo delete-region: remove the pieces and restore original clip
-                let cur_sel_clip = self.selected_clip;
-                let cur_selection = self.selection;
-                for _ in 0..num_pieces {
-                    self.tracks[track_idx].clips.remove(clip_idx);
-                }
-                self.tracks[track_idx].clips.insert(clip_idx, original_clip.clone());
-                self.selected_track = Some(track_idx);
-                self.selected_clip = prev_sel_clip;
-                self.selection = prev_selection;
-                // Reverse: delete the region again
-                undo::UndoAction::DeleteRegion {
-                    track_idx, clip_idx, original_clip,
-                    num_pieces,
-                    prev_sel_clip: cur_sel_clip,
-                    prev_selection: cur_selection,
-                }
-            }
-            undo::UndoAction::PasteClip {
-                track_idx, clip_idx, prev_sel_clip,
-            } => {
-                // Undo paste: remove the pasted clip
-                let cur_sel_clip = self.selected_clip;
-                let clip = self.tracks[track_idx].clips.remove(clip_idx);
-                self.selected_clip = prev_sel_clip;
-                undo::UndoAction::DeleteClip {
-                    track_idx,
-                    clip_idx,
-                    clip,
-                    track_was_removed: false,
-                    prev_sel_track: self.selected_track,
                     prev_sel_clip: cur_sel_clip,
                 }
             }
@@ -302,50 +264,117 @@ impl App {
                 self.tracks[track_idx].muted = !self.tracks[track_idx].muted;
                 undo::UndoAction::ToggleMute { track_idx }
             }
+            undo::UndoAction::PasteClips {
+                track_idx, prev_clips, prev_sel_clip,
+            } => {
+                let cur_sel_clip = self.selected_clip;
+                let cur_clips = std::mem::replace(&mut self.tracks[track_idx].clips, prev_clips);
+                self.selected_clip = prev_sel_clip;
+                undo::UndoAction::PasteClips {
+                    track_idx, prev_clips: cur_clips, prev_sel_clip: cur_sel_clip,
+                }
+            }
+            undo::UndoAction::CutRegion {
+                track_idx, prev_clips, prev_clipboard, prev_sel_clip, prev_selection,
+            } => {
+                let cur_sel_clip = self.selected_clip;
+                let cur_selection = self.selection;
+                let cur_clips = std::mem::replace(&mut self.tracks[track_idx].clips, prev_clips);
+                let cur_clipboard = std::mem::replace(&mut self.clipboard, prev_clipboard);
+                self.selected_track = Some(track_idx);
+                self.selected_clip = prev_sel_clip;
+                self.selection = prev_selection;
+                undo::UndoAction::CutRegion {
+                    track_idx, prev_clips: cur_clips, prev_clipboard: cur_clipboard,
+                    prev_sel_clip: cur_sel_clip, prev_selection: cur_selection,
+                }
+            }
+            undo::UndoAction::DeleteRegionMulti {
+                track_idx, prev_clips, prev_sel_clip, prev_selection,
+            } => {
+                let cur_sel_clip = self.selected_clip;
+                let cur_selection = self.selection;
+                let cur_clips = std::mem::replace(&mut self.tracks[track_idx].clips, prev_clips);
+                self.selected_track = Some(track_idx);
+                self.selected_clip = prev_sel_clip;
+                self.selection = prev_selection;
+                undo::UndoAction::DeleteRegionMulti {
+                    track_idx, prev_clips: cur_clips,
+                    prev_sel_clip: cur_sel_clip, prev_selection: cur_selection,
+                }
+            }
+            undo::UndoAction::MoveClips {
+                track_idx, moves, prev_sel_track, prev_sel_clip,
+            } => {
+                let cur_sel_track = self.selected_track;
+                let cur_sel_clip = self.selected_clip;
+                // Reverse: swap before/after offsets
+                let reverse_moves: Vec<(usize, f64, f64)> = moves.iter()
+                    .map(|&(idx, before, after)| {
+                        if idx < self.tracks[track_idx].clips.len() {
+                            self.tracks[track_idx].clips[idx].offset_secs = before;
+                        }
+                        (idx, after, before)
+                    })
+                    .collect();
+                self.selected_track = prev_sel_track;
+                self.selected_clip = prev_sel_clip;
+                undo::UndoAction::MoveClips {
+                    track_idx, moves: reverse_moves,
+                    prev_sel_track: cur_sel_track, prev_sel_clip: cur_sel_clip,
+                }
+            }
         }
     }
 
-    pub(crate) fn open_file(&mut self) {
+    /// Start loading an audio file from a path (after file dialog completed).
+    pub(crate) fn import_file_from_path(&mut self, path: std::path::PathBuf) {
         if self.loading.is_some() {
-            return; // already loading
+            return;
         }
+        let result: Arc<Mutex<Option<Result<audio::Clip, String>>>> =
+            Arc::new(Mutex::new(None));
+        let progress = Arc::new(AtomicU8::new(0));
 
-        let file = rfd::FileDialog::new()
-            .add_filter("Audio", &["wav", "mp3", "flac", "ogg", "m4a", "aac"])
-            .pick_file();
+        let result_clone = result.clone();
+        let progress_clone = progress.clone();
+        let project_rate = self.project_rate;
 
-        if let Some(path) = file {
-            let result: Arc<Mutex<Option<Result<audio::Clip, String>>>> =
-                Arc::new(Mutex::new(None));
-            let progress = Arc::new(AtomicU8::new(0));
+        std::thread::spawn(move || {
+            let on_progress = move |frac: f32| {
+                progress_clone.store((frac * 100.0) as u8, Ordering::Relaxed);
+            };
+            let res = audio::load_file(&path, project_rate, &on_progress)
+                .map_err(|e| e.to_string());
+            *result_clone.lock().unwrap() = Some(res);
+        });
 
-            let result_clone = result.clone();
-            let progress_clone = progress.clone();
-            let project_rate = self.project_rate;
+        let clip_offset_secs = self.playhead_secs();
 
-            std::thread::spawn(move || {
-                let on_progress = move |frac: f32| {
-                    progress_clone.store((frac * 100.0) as u8, Ordering::Relaxed);
-                };
-                let res = audio::load_file(&path, project_rate, &on_progress)
-                    .map_err(|e| e.to_string());
-                *result_clone.lock().unwrap() = Some(res);
-            });
-
-            let clip_offset_secs = self.playhead_secs();
-
-            self.loading = Some(PendingLoad { result, progress, target_track: None, clip_offset_secs });
-            self.window.as_ref().unwrap().set_title("Loading…");
-        }
+        self.loading = Some(PendingLoad { result, progress, target_track: None, clip_offset_secs });
+        self.window.as_ref().unwrap().set_title("Loading…");
     }
 
-    pub(crate) fn save_project(&mut self) {
+    /// Save project to existing path (no dialog). Returns false if no path is set.
+    pub(crate) fn save_project_to_existing_path(&mut self) -> bool {
         let path = if let Some(ref path) = self.project_path {
             path.clone()
         } else {
-            self.save_project_as();
-            return;
+            return false;
         };
+        match project::save_project(&path, &self.tracks, self.project_rate) {
+            Ok(()) => {
+                self.undo_manager.mark_saved();
+                self.update_title();
+            }
+            Err(e) => eprintln!("Failed to save project: {e}"),
+        }
+        true
+    }
+
+    /// Save project to the given path (after save dialog completed).
+    pub(crate) fn save_project_to_path(&mut self, path: std::path::PathBuf) {
+        self.project_path = Some(path.clone());
         match project::save_project(&path, &self.tracks, self.project_rate) {
             Ok(()) => {
                 self.undo_manager.mark_saved();
@@ -355,52 +384,29 @@ impl App {
         }
     }
 
-    pub(crate) fn save_project_as(&mut self) {
-        let file = rfd::FileDialog::new()
-            .set_title("Save Project")
-            .set_file_name("project.ron")
-            .add_filter("Project", &["ron"])
-            .save_file();
-        if let Some(file) = file {
-            self.project_path = Some(file.clone());
-            match project::save_project(&file, &self.tracks, self.project_rate) {
-                Ok(()) => {
-                    self.undo_manager.mark_saved();
-                    self.update_title();
-                }
-                Err(e) => eprintln!("Failed to save project: {e}"),
+    /// Open a project from the given path (after open dialog completed).
+    pub(crate) fn open_project_from_path(&mut self, file: std::path::PathBuf) {
+        match project::load_project(&file) {
+            Ok((tracks, rate)) => {
+                let prev_tracks = std::mem::replace(&mut self.tracks, tracks);
+                let prev_project_path = std::mem::replace(&mut self.project_path, Some(file));
+                let prev_project_rate = std::mem::replace(&mut self.project_rate, rate);
+                let prev_sel_track = self.selected_track;
+                let prev_sel_clip = self.selected_clip;
+                self.undo_manager.push(undo::UndoAction::LoadProject {
+                    prev_tracks, prev_project_path, prev_project_rate,
+                    prev_sel_track, prev_sel_clip,
+                });
+                self.selected_track = None;
+                self.selected_clip = None;
+                self.view_start = 0.0;
+                self.view_duration = self.max_duration();
+                self.rebuild_player();
+                self.undo_manager.mark_saved();
+                self.update_title();
+                self.window.as_ref().unwrap().request_redraw();
             }
-        }
-    }
-
-    pub(crate) fn open_project(&mut self) {
-        let file = rfd::FileDialog::new()
-            .set_title("Open Project")
-            .add_filter("Project", &["ron"])
-            .pick_file();
-        if let Some(file) = file {
-            match project::load_project(&file) {
-                Ok((tracks, rate)) => {
-                    let prev_tracks = std::mem::replace(&mut self.tracks, tracks);
-                    let prev_project_path = std::mem::replace(&mut self.project_path, Some(file));
-                    let prev_project_rate = std::mem::replace(&mut self.project_rate, rate);
-                    let prev_sel_track = self.selected_track;
-                    let prev_sel_clip = self.selected_clip;
-                    self.undo_manager.push(undo::UndoAction::LoadProject {
-                        prev_tracks, prev_project_path, prev_project_rate,
-                        prev_sel_track, prev_sel_clip,
-                    });
-                    self.selected_track = None;
-                    self.selected_clip = None;
-                    self.view_start = 0.0;
-                    self.view_duration = self.max_duration();
-                    self.rebuild_player();
-                    self.undo_manager.mark_saved();
-                    self.update_title();
-                    self.window.as_ref().unwrap().request_redraw();
-                }
-                Err(e) => eprintln!("Failed to load project: {e}"),
-            }
+            Err(e) => eprintln!("Failed to load project: {e}"),
         }
     }
 

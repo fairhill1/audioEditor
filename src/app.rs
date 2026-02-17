@@ -46,6 +46,9 @@ pub(crate) struct DragState {
     pub(crate) source_clip_idx: usize,
     pub(crate) prev_selected_track: Option<usize>,
     pub(crate) prev_selected_clip: Option<usize>,
+    /// Group drag: (clip_idx, original_offset) for all clips being dragged together.
+    /// Empty means single-clip drag.
+    pub(crate) group: Vec<(usize, f64)>,
 }
 
 pub(crate) const DRAG_THRESHOLD_PX: f64 = 4.0;
@@ -55,6 +58,23 @@ pub(crate) const SELECTION_EDGE_PX: f64 = 6.0;
 pub(crate) enum SelectionEdge {
     Left,
     Right,
+}
+
+/// Actions that open native dialogs. These are spawned on a background thread
+/// to avoid winit's re-entrant event handling panic on macOS (the rfd modal
+/// dialog pumps its own event loop, which can deliver events while winit's
+/// handle_event is still on the stack).
+pub(crate) enum DeferredAction {
+    OpenFile,
+    OpenProject,
+    SaveProject,
+    SaveProjectAs,
+}
+
+/// A native file dialog running on a background thread.
+pub(crate) struct PendingDialog {
+    pub(crate) result: Arc<Mutex<Option<Option<PathBuf>>>>,
+    pub(crate) action: DeferredAction,
 }
 
 pub(crate) struct App {
@@ -83,8 +103,10 @@ pub(crate) struct App {
     pub(crate) selection: Option<(f64, f64)>,
     pub(crate) selecting: bool,
     pub(crate) selecting_edge: Option<SelectionEdge>,
-    pub(crate) clipboard: Option<audio::Clip>,
+    pub(crate) clipboard: Vec<audio::Clip>,
     pub(crate) undo_manager: undo::UndoManager,
+    pub(crate) deferred_action: Option<DeferredAction>,
+    pub(crate) pending_dialog: Option<PendingDialog>,
     // Text rendering (glyphon)
     pub(crate) font_system: Option<FontSystem>,
     pub(crate) swash_cache: Option<SwashCache>,
@@ -121,8 +143,10 @@ impl App {
             selection: None,
             selecting: false,
             selecting_edge: None,
-            clipboard: None,
+            clipboard: Vec::new(),
             undo_manager: undo::UndoManager::new(100),
+            deferred_action: None,
+            pending_dialog: None,
             font_system: None,
             swash_cache: None,
             glyphon_cache: None,
