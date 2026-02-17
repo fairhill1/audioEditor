@@ -2,6 +2,7 @@ mod audio;
 mod modal;
 mod playback;
 mod project;
+mod undo;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -53,6 +54,9 @@ struct DragState {
     source_track_idx: usize,  // track the clip originally lived on
     current_track_idx: usize,
     active: bool, // becomes true once cursor moves past threshold
+    source_clip_idx: usize,   // original clip index before drag
+    prev_selected_track: Option<usize>,
+    prev_selected_clip: Option<usize>,
 }
 
 const DRAG_THRESHOLD_PX: f64 = 4.0;
@@ -81,6 +85,7 @@ struct App {
     loading: Option<PendingLoad>,
     dragging: Option<DragState>,
     clipboard: Option<audio::Clip>,
+    undo_manager: undo::UndoManager,
     // Text rendering (glyphon)
     font_system: Option<FontSystem>,
     swash_cache: Option<SwashCache>,
@@ -115,6 +120,7 @@ impl App {
             loading: None,
             dragging: None,
             clipboard: None,
+            undo_manager: undo::UndoManager::new(100),
             font_system: None,
             swash_cache: None,
             glyphon_cache: None,
@@ -635,6 +641,294 @@ impl App {
         self.player = playback::Player::new(&self.tracks);
     }
 
+    fn perform_undo(&mut self) {
+        let action = match self.undo_manager.pop_undo() {
+            Some(a) => a,
+            None => return,
+        };
+        let reverse = self.apply_undo_action(action);
+        self.undo_manager.push_redo(reverse);
+        self.rebuild_player();
+        self.update_title();
+        self.window.as_ref().unwrap().request_redraw();
+    }
+
+    fn perform_redo(&mut self) {
+        let action = match self.undo_manager.pop_redo() {
+            Some(a) => a,
+            None => return,
+        };
+        let reverse = self.apply_undo_action(action);
+        self.undo_manager.push_undo(reverse);
+        self.rebuild_player();
+        self.update_title();
+        self.window.as_ref().unwrap().request_redraw();
+    }
+
+    /// Apply an undo action and return the reverse action to push onto the opposite stack.
+    fn apply_undo_action(&mut self, action: undo::UndoAction) -> undo::UndoAction {
+        match action {
+            undo::UndoAction::DeleteClip {
+                track_idx, clip_idx, clip, track_was_removed,
+                prev_sel_track, prev_sel_clip,
+            } => {
+                // Undo delete: re-insert the clip (and track if it was removed)
+                let cur_sel_track = self.selected_track;
+                let cur_sel_clip = self.selected_clip;
+                if track_was_removed {
+                    self.tracks.insert(track_idx, audio::Track { clips: vec![] });
+                }
+                self.tracks[track_idx].clips.insert(clip_idx, clip.clone());
+                self.selected_track = prev_sel_track;
+                self.selected_clip = prev_sel_clip;
+                // Reverse: delete it again
+                undo::UndoAction::DeleteClip {
+                    track_idx, clip_idx, clip,
+                    track_was_removed,
+                    prev_sel_track: cur_sel_track,
+                    prev_sel_clip: cur_sel_clip,
+                }
+            }
+            undo::UndoAction::SplitClip {
+                track_idx, clip_idx, original_clip, prev_sel_clip,
+            } => {
+                // Undo split: remove the two halves and restore original
+                let cur_sel_clip = self.selected_clip;
+                // The split produced clips at clip_idx and clip_idx+1
+                // Save current two halves so redo can re-split
+                let left = self.tracks[track_idx].clips.remove(clip_idx);
+                let right = self.tracks[track_idx].clips.remove(clip_idx); // was clip_idx+1, now clip_idx
+                self.tracks[track_idx].clips.insert(clip_idx, original_clip.clone());
+                self.selected_clip = prev_sel_clip;
+                // Reverse: split again (store the original we just restored)
+                // On redo, we re-split the original clip the same way
+                let split_secs = left.duration_secs();
+                let mut redo_original = original_clip;
+                let redo_right = redo_original.split_at(split_secs);
+                // But wait — we already modified redo_original in place. We need the full original for redo.
+                // Actually, let's just re-merge left+right back into the original for the reverse.
+                // Simpler: store the original clip (pre-split) so redo can split it again.
+                // We already have the merged original in tracks. Clone it for the redo action.
+                let merged = self.tracks[track_idx].clips[clip_idx].clone();
+                // Undo the split_at we accidentally did on redo_original — just use merged
+                // For redo, we provide SplitClip with the merged clip as original
+                undo::UndoAction::SplitClip {
+                    track_idx, clip_idx,
+                    original_clip: merged,
+                    prev_sel_clip: cur_sel_clip,
+                }
+            }
+            undo::UndoAction::CutClip {
+                track_idx, clip_idx, clip, prev_clipboard, prev_sel_clip,
+            } => {
+                // Undo cut: re-insert the clip, restore previous clipboard
+                let cur_sel_clip = self.selected_clip;
+                let cur_clipboard = self.clipboard.take();
+                self.tracks[track_idx].clips.insert(clip_idx, clip.clone());
+                self.clipboard = prev_clipboard;
+                self.selected_track = Some(track_idx);
+                self.selected_clip = prev_sel_clip;
+                // Reverse: cut it again
+                undo::UndoAction::CutClip {
+                    track_idx, clip_idx, clip,
+                    prev_clipboard: cur_clipboard,
+                    prev_sel_clip: cur_sel_clip,
+                }
+            }
+            undo::UndoAction::PasteClip {
+                track_idx, clip_idx, prev_sel_clip,
+            } => {
+                // Undo paste: remove the pasted clip
+                let cur_sel_clip = self.selected_clip;
+                let clip = self.tracks[track_idx].clips.remove(clip_idx);
+                self.selected_clip = prev_sel_clip;
+                // Reverse: paste it back
+                // We store the clip data so redo can re-insert
+                // But PasteClip doesn't store the clip itself — we need the removed clip for redo
+                // On redo, we re-insert the clip. We'll use a trick: return a "reverse paste"
+                // which is an ImportClip-like action, but let's keep it symmetric.
+                // Actually the simplest: redo of "undo paste" is "paste again at same position"
+                // We'll re-insert via the reverse action. For that, we return a PasteClip action.
+                // But PasteClip doesn't carry clip data... Let me store it differently.
+                // Actually let's just re-insert via a DeleteClip reverse.
+                // Hmm, let's just return a PasteClip that when applied, will... no.
+                // The cleanest approach: on undo, we remove the clip and return a reverse action
+                // that re-inserts it. That reverse action is itself an "undo of delete" which
+                // is a DeleteClip action. But that gets confusing.
+                // Let me just create a special InsertClip-like approach by using DeleteClip:
+                // When the redo stack pops this, apply_undo_action will see DeleteClip,
+                // which re-inserts the clip (undoing a delete). That's correct for redo of paste.
+                undo::UndoAction::DeleteClip {
+                    track_idx,
+                    clip_idx,
+                    clip,
+                    track_was_removed: false,
+                    prev_sel_track: self.selected_track,
+                    prev_sel_clip: cur_sel_clip,
+                }
+            }
+            undo::UndoAction::CreateTrack {
+                track_idx, prev_sel_track, prev_sel_clip,
+            } => {
+                // Undo create: remove the track
+                let cur_sel_track = self.selected_track;
+                let cur_sel_clip = self.selected_clip;
+                self.tracks.remove(track_idx);
+                self.selected_track = prev_sel_track;
+                self.selected_clip = prev_sel_clip;
+                // Reverse: create it again
+                undo::UndoAction::CreateTrack {
+                    track_idx,
+                    prev_sel_track: cur_sel_track,
+                    prev_sel_clip: cur_sel_clip,
+                }
+            }
+            undo::UndoAction::MoveClip {
+                src_track, src_clip_idx, src_offset,
+                dest_track, dest_clip_idx, dest_offset,
+                src_track_was_removed,
+                prev_sel_track, prev_sel_clip,
+            } => {
+                // Undo move: move clip back from dest to src
+                let cur_sel_track = self.selected_track;
+                let cur_sel_clip = self.selected_clip;
+
+                // If the source track was removed during the original move, re-create it
+                let actual_dest_track = if src_track_was_removed && dest_track >= src_track {
+                    dest_track // dest_track index was already adjusted
+                } else {
+                    dest_track
+                };
+
+                if actual_dest_track < self.tracks.len()
+                    && dest_clip_idx < self.tracks[actual_dest_track].clips.len()
+                {
+                    let mut clip = self.tracks[actual_dest_track].clips.remove(dest_clip_idx);
+                    clip.offset_secs = src_offset;
+
+                    if src_track_was_removed {
+                        // Re-insert the source track
+                        self.tracks.insert(src_track, audio::Track { clips: vec![clip] });
+                    } else {
+                        let insert_at = src_clip_idx.min(self.tracks[src_track].clips.len());
+                        self.tracks[src_track].clips.insert(insert_at, clip);
+                    }
+
+                    // Clean up empty dest track if the move emptied it
+                    let check_dest = if src_track_was_removed && actual_dest_track >= src_track {
+                        actual_dest_track + 1
+                    } else {
+                        actual_dest_track
+                    };
+                    let reverse_src_removed = if check_dest < self.tracks.len()
+                        && self.tracks[check_dest].clips.is_empty()
+                    {
+                        self.tracks.remove(check_dest);
+                        true
+                    } else {
+                        false
+                    };
+
+                    self.selected_track = prev_sel_track;
+                    self.selected_clip = prev_sel_clip;
+
+                    // Reverse: move it forward again
+                    let new_dest_clip_idx = if src_track_was_removed {
+                        0
+                    } else {
+                        src_clip_idx.min(self.tracks[src_track].clips.len().saturating_sub(1))
+                    };
+                    undo::UndoAction::MoveClip {
+                        src_track: if src_track_was_removed { src_track } else { src_track },
+                        src_clip_idx: new_dest_clip_idx,
+                        src_offset,
+                        dest_track: actual_dest_track,
+                        dest_clip_idx,
+                        dest_offset,
+                        src_track_was_removed: reverse_src_removed,
+                        prev_sel_track: cur_sel_track,
+                        prev_sel_clip: cur_sel_clip,
+                    }
+                } else {
+                    // Can't apply, return a no-op by recreating the same action
+                    undo::UndoAction::MoveClip {
+                        src_track, src_clip_idx, src_offset,
+                        dest_track, dest_clip_idx, dest_offset,
+                        src_track_was_removed,
+                        prev_sel_track: cur_sel_track,
+                        prev_sel_clip: cur_sel_clip,
+                    }
+                }
+            }
+            undo::UndoAction::ImportClip {
+                track_idx, clip_idx, created_new_track,
+                prev_sel_track, prev_sel_clip,
+            } => {
+                // Undo import: remove the clip (and track if created)
+                let cur_sel_track = self.selected_track;
+                let cur_sel_clip = self.selected_clip;
+                let clip = self.tracks[track_idx].clips.remove(clip_idx);
+                if created_new_track && self.tracks[track_idx].clips.is_empty() {
+                    self.tracks.remove(track_idx);
+                }
+                self.selected_track = prev_sel_track;
+                self.selected_clip = prev_sel_clip;
+                // Reverse: re-import (re-insert clip)
+                // We use DeleteClip to represent "insert this clip back"
+                undo::UndoAction::DeleteClip {
+                    track_idx,
+                    clip_idx,
+                    clip,
+                    track_was_removed: created_new_track,
+                    prev_sel_track: cur_sel_track,
+                    prev_sel_clip: cur_sel_clip,
+                }
+            }
+            undo::UndoAction::GenerateClickTrack {
+                track_idx, prev_sel_track, prev_sel_clip,
+            } => {
+                // Undo generate: remove the track
+                let cur_sel_track = self.selected_track;
+                let cur_sel_clip = self.selected_clip;
+                let clip = self.tracks[track_idx].clips.remove(0);
+                self.tracks.remove(track_idx);
+                self.selected_track = prev_sel_track;
+                self.selected_clip = prev_sel_clip;
+                // Reverse: re-add the click track
+                // Use DeleteClip with track_was_removed to re-create track + clip
+                undo::UndoAction::DeleteClip {
+                    track_idx,
+                    clip_idx: 0,
+                    clip,
+                    track_was_removed: true,
+                    prev_sel_track: cur_sel_track,
+                    prev_sel_clip: cur_sel_clip,
+                }
+            }
+            undo::UndoAction::LoadProject {
+                prev_tracks, prev_project_path, prev_project_rate,
+                prev_sel_track, prev_sel_clip,
+            } => {
+                let cur_tracks = std::mem::replace(&mut self.tracks, prev_tracks);
+                let cur_path = std::mem::replace(&mut self.project_path, prev_project_path);
+                let cur_rate = std::mem::replace(&mut self.project_rate, prev_project_rate);
+                let cur_sel_track = self.selected_track;
+                let cur_sel_clip = self.selected_clip;
+                self.selected_track = prev_sel_track;
+                self.selected_clip = prev_sel_clip;
+                self.view_start = 0.0;
+                self.view_duration = self.max_duration();
+                undo::UndoAction::LoadProject {
+                    prev_tracks: cur_tracks,
+                    prev_project_path: cur_path,
+                    prev_project_rate: cur_rate,
+                    prev_sel_track: cur_sel_track,
+                    prev_sel_clip: cur_sel_clip,
+                }
+            }
+        }
+    }
+
     fn open_file(&mut self) {
         if self.loading.is_some() {
             return; // already loading
@@ -705,9 +999,15 @@ impl App {
         if let Some(file) = file {
             match project::load_project(&file) {
                 Ok((tracks, rate)) => {
-                    self.tracks = tracks;
-                    self.project_rate = rate;
-                    self.project_path = Some(file);
+                    let prev_tracks = std::mem::replace(&mut self.tracks, tracks);
+                    let prev_project_path = std::mem::replace(&mut self.project_path, Some(file));
+                    let prev_project_rate = std::mem::replace(&mut self.project_rate, rate);
+                    let prev_sel_track = self.selected_track;
+                    let prev_sel_clip = self.selected_clip;
+                    self.undo_manager.push(undo::UndoAction::LoadProject {
+                        prev_tracks, prev_project_path, prev_project_rate,
+                        prev_sel_track, prev_sel_clip,
+                    });
                     self.selected_track = None;
                     self.selected_clip = None;
                     self.view_start = 0.0;
@@ -748,11 +1048,19 @@ impl App {
             if let Ok(mut clip) = res {
                 clip.offset_secs = pending.clip_offset_secs;
 
+                let prev_sel_track = self.selected_track;
+                let prev_sel_clip = self.selected_clip;
+
                 if let Some(track_idx) = pending.target_track {
                     // Add clip to existing track
                     if track_idx < self.tracks.len() {
-                        self.selected_clip = Some(self.tracks[track_idx].clips.len());
+                        let clip_idx = self.tracks[track_idx].clips.len();
                         self.tracks[track_idx].clips.push(clip);
+                        self.undo_manager.push(undo::UndoAction::ImportClip {
+                            track_idx, clip_idx, created_new_track: false,
+                            prev_sel_track, prev_sel_clip,
+                        });
+                        self.selected_clip = Some(clip_idx);
                         self.selected_track = Some(track_idx);
                     }
                 } else {
@@ -760,7 +1068,12 @@ impl App {
                     self.tracks.push(audio::Track {
                         clips: vec![clip],
                     });
-                    self.selected_track = Some(self.tracks.len() - 1);
+                    let track_idx = self.tracks.len() - 1;
+                    self.undo_manager.push(undo::UndoAction::ImportClip {
+                        track_idx, clip_idx: 0, created_new_track: true,
+                        prev_sel_track, prev_sel_clip,
+                    });
+                    self.selected_track = Some(track_idx);
                     self.selected_clip = Some(0);
                 }
 
@@ -790,10 +1103,16 @@ impl App {
     fn handle_modal_result(&mut self, result: modal::ModalResult) {
         match result {
             modal::ModalResult::ClickTrackBpm(bpm) => {
+                let prev_sel_track = self.selected_track;
+                let prev_sel_clip = self.selected_clip;
                 let dur = if self.max_duration() > 0.0 { self.max_duration() } else { 30.0 };
                 let clip = audio::generate_click_track(bpm, dur, self.project_rate);
                 self.tracks.push(audio::Track {
                     clips: vec![clip],
+                });
+                let track_idx = self.tracks.len() - 1;
+                self.undo_manager.push(undo::UndoAction::GenerateClickTrack {
+                    track_idx, prev_sel_track, prev_sel_clip,
                 });
                 self.view_duration = self.max_duration();
                 self.view_start = 0.0;
@@ -1196,6 +1515,24 @@ impl ApplicationHandler for App {
             {
                 self.save_project_as();
             }
+            // Cmd+Shift+Z: Redo
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && event.physical_key == PhysicalKey::Code(KeyCode::KeyZ)
+                    && self.modifiers.super_key()
+                    && self.modifiers.shift_key() =>
+            {
+                self.perform_redo();
+            }
+            // Cmd+Z: Undo
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && event.physical_key == PhysicalKey::Code(KeyCode::KeyZ)
+                    && self.modifiers.super_key()
+                    && !self.modifiers.shift_key() =>
+            {
+                self.perform_undo();
+            }
             // Cmd+C: Copy selected clip
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed
@@ -1216,7 +1553,13 @@ impl ApplicationHandler for App {
             {
                 if let (Some(track_idx), Some(clip_idx)) = (self.selected_track, self.selected_clip) {
                     if track_idx < self.tracks.len() && clip_idx < self.tracks[track_idx].clips.len() {
+                        let prev_clipboard = self.clipboard.clone();
+                        let prev_sel_clip = self.selected_clip;
                         let clip = self.tracks[track_idx].clips.remove(clip_idx);
+                        self.undo_manager.push(undo::UndoAction::CutClip {
+                            track_idx, clip_idx, clip: clip.clone(),
+                            prev_clipboard, prev_sel_clip,
+                        });
                         self.clipboard = Some(clip);
                         if self.tracks[track_idx].clips.is_empty() {
                             self.selected_clip = None;
@@ -1250,8 +1593,12 @@ impl ApplicationHandler for App {
                         });
 
                         if !overlaps {
+                            let prev_sel_clip = self.selected_clip;
                             let new_idx = self.tracks[track_idx].clips.len();
                             self.tracks[track_idx].clips.push(new_clip);
+                            self.undo_manager.push(undo::UndoAction::PasteClip {
+                                track_idx, clip_idx: new_idx, prev_sel_clip,
+                            });
                             self.selected_clip = Some(new_idx);
                             self.rebuild_player();
                             self.window.as_ref().unwrap().request_redraw();
@@ -1265,8 +1612,13 @@ impl ApplicationHandler for App {
                     && self.modifiers.super_key() =>
             {
                 // Insert new empty track below the selected track (or at the end)
+                let prev_sel_track = self.selected_track;
+                let prev_sel_clip = self.selected_clip;
                 let insert_at = self.selected_track.map_or(self.tracks.len(), |i| i + 1);
                 self.tracks.insert(insert_at, audio::Track { clips: vec![] });
+                self.undo_manager.push(undo::UndoAction::CreateTrack {
+                    track_idx: insert_at, prev_sel_track, prev_sel_clip,
+                });
                 self.selected_track = Some(insert_at);
                 self.selected_clip = None;
                 self.rebuild_player();
@@ -1286,9 +1638,14 @@ impl ApplicationHandler for App {
                     let clip_end = clip_start + clip.duration_secs();
                     // Only split if playhead is strictly inside the clip
                     if playhead > clip_start && playhead < clip_end {
+                        let original_clip = self.tracks[track_idx].clips[clip_idx].clone();
+                        let prev_sel_clip = self.selected_clip;
                         let split_at = playhead - clip_start;
                         let right = self.tracks[track_idx].clips[clip_idx].split_at(split_at);
                         self.tracks[track_idx].clips.insert(clip_idx + 1, right);
+                        self.undo_manager.push(undo::UndoAction::SplitClip {
+                            track_idx, clip_idx, original_clip, prev_sel_clip,
+                        });
                         // Select the right half
                         self.selected_clip = Some(clip_idx + 1);
                         self.rebuild_player();
@@ -1303,9 +1660,12 @@ impl ApplicationHandler for App {
             {
                 if let (Some(track_idx), Some(clip_idx)) = (self.selected_track, self.selected_clip) {
                     if track_idx < self.tracks.len() && clip_idx < self.tracks[track_idx].clips.len() {
-                        self.tracks[track_idx].clips.remove(clip_idx);
+                        let prev_sel_track = self.selected_track;
+                        let prev_sel_clip = self.selected_clip;
+                        let clip = self.tracks[track_idx].clips.remove(clip_idx);
                         // Remove track if it's now empty
-                        if self.tracks[track_idx].clips.is_empty() {
+                        let track_was_removed = self.tracks[track_idx].clips.is_empty();
+                        if track_was_removed {
                             self.tracks.remove(track_idx);
                             if self.tracks.is_empty() {
                                 self.selected_track = None;
@@ -1318,6 +1678,10 @@ impl ApplicationHandler for App {
                             // Select previous clip or first clip
                             self.selected_clip = Some(clip_idx.min(self.tracks[track_idx].clips.len() - 1));
                         }
+                        self.undo_manager.push(undo::UndoAction::DeleteClip {
+                            track_idx, clip_idx, clip, track_was_removed,
+                            prev_sel_track, prev_sel_clip,
+                        });
                         self.view_start = 0.0;
                         self.view_duration = self.max_duration();
                         self.rebuild_player();
@@ -1439,6 +1803,9 @@ impl ApplicationHandler for App {
                         source_track_idx: track_idx,
                         current_track_idx: track_idx,
                         active: false,
+                        source_clip_idx: clip_idx,
+                        prev_selected_track: self.selected_track,
+                        prev_selected_clip: self.selected_clip,
                     });
                 } else if !self.tracks.is_empty() {
                     // Click on empty area — select track but deselect clip
@@ -1470,13 +1837,32 @@ impl ApplicationHandler for App {
                     if drag.active {
                         let mut sel_track = drag.current_track_idx;
                         let sel_clip = drag.clip_idx;
+                        let dest_offset = self.tracks[sel_track].clips[sel_clip].offset_secs;
                         // Remove the source track only if the drag emptied it
                         let src = drag.source_track_idx;
-                        if src < self.tracks.len() && self.tracks[src].clips.is_empty() {
+                        let src_track_was_removed = src < self.tracks.len() && self.tracks[src].clips.is_empty();
+                        if src_track_was_removed {
                             self.tracks.remove(src);
                             if src < sel_track {
                                 sel_track -= 1;
                             }
+                        }
+                        // Only push undo if something actually changed
+                        let moved = drag.source_track_idx != sel_track
+                            || drag.start_offset != dest_offset
+                            || src_track_was_removed;
+                        if moved {
+                            self.undo_manager.push(undo::UndoAction::MoveClip {
+                                src_track: drag.source_track_idx,
+                                src_clip_idx: drag.source_clip_idx,
+                                src_offset: drag.start_offset,
+                                dest_track: sel_track,
+                                dest_clip_idx: sel_clip,
+                                dest_offset,
+                                src_track_was_removed,
+                                prev_sel_track: drag.prev_selected_track,
+                                prev_sel_clip: drag.prev_selected_clip,
+                            });
                         }
                         if self.tracks.is_empty() {
                             self.selected_track = None;
