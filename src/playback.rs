@@ -43,6 +43,9 @@ impl Player {
         let mut mixed = vec![0.0_f32; total_samples];
 
         for track in tracks {
+            if track.muted {
+                continue;
+            }
             for clip in &track.clips {
                 let ch = clip.channels as usize;
                 let frames = clip.samples.len() / ch;

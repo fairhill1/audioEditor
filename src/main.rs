@@ -464,8 +464,15 @@ impl App {
         let mut vertices = Vec::new();
 
         for (idx, track) in self.tracks.iter().enumerate() {
-            let base_color = TRACK_COLORS[idx % TRACK_COLORS.len()];
-            let bright_color = SELECTED_CLIP_COLORS[idx % SELECTED_CLIP_COLORS.len()];
+            let dim = if track.muted { 0.35 } else { 1.0 };
+            let base_color = {
+                let c = TRACK_COLORS[idx % TRACK_COLORS.len()];
+                [c[0] * dim, c[1] * dim, c[2] * dim]
+            };
+            let bright_color = {
+                let c = SELECTED_CLIP_COLORS[idx % SELECTED_CLIP_COLORS.len()];
+                [c[0] * dim, c[1] * dim, c[2] * dim]
+            };
 
             let lane_top = 1.0 - idx as f32 * lane_height;
             let lane_bot = lane_top - lane_height;
@@ -490,7 +497,9 @@ impl App {
             // Track label background (far left column)
             let label_w_physical = Self::TRACK_LABEL_LP * self.scale_factor();
             let label_x1_ndc = -1.0 + label_w_physical / width as f32 * 2.0;
-            let label_bg = if self.selected_track == Some(idx) {
+            let label_bg = if track.muted {
+                [0.28, 0.15, 0.15]
+            } else if self.selected_track == Some(idx) {
                 [0.22, 0.22, 0.28]
             } else {
                 [0.15, 0.15, 0.18]
@@ -638,7 +647,14 @@ impl App {
     }
 
     fn rebuild_player(&mut self) {
+        let prev = self.player.as_ref().map(|p| (p.is_playing(), p.position_frac()));
         self.player = playback::Player::new(&self.tracks);
+        if let (Some((was_playing, frac)), Some(player)) = (prev, &self.player) {
+            player.seek_frac(frac);
+            if was_playing {
+                player.state.playing.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
 
     fn perform_undo(&mut self) {
@@ -676,7 +692,7 @@ impl App {
                 let cur_sel_track = self.selected_track;
                 let cur_sel_clip = self.selected_clip;
                 if track_was_removed {
-                    self.tracks.insert(track_idx, audio::Track { clips: vec![] });
+                    self.tracks.insert(track_idx, audio::Track { clips: vec![], muted: false });
                 }
                 self.tracks[track_idx].clips.insert(clip_idx, clip.clone());
                 self.selected_track = prev_sel_track;
@@ -799,7 +815,7 @@ impl App {
 
                     if src_track_was_removed {
                         // Re-insert the source track
-                        self.tracks.insert(src_track, audio::Track { clips: vec![clip] });
+                        self.tracks.insert(src_track, audio::Track { clips: vec![clip], muted: false });
                     } else {
                         let insert_at = src_clip_idx.min(self.tracks[src_track].clips.len());
                         self.tracks[src_track].clips.insert(insert_at, clip);
@@ -1065,6 +1081,7 @@ impl App {
                     // Create a new track with this clip
                     self.tracks.push(audio::Track {
                         clips: vec![clip],
+                        muted: false,
                     });
                     let track_idx = self.tracks.len() - 1;
                     self.undo_manager.push(undo::UndoAction::ImportClip {
@@ -1108,6 +1125,7 @@ impl App {
                 let clip = audio::generate_click_track(bpm, dur, self.project_rate);
                 self.tracks.push(audio::Track {
                     clips: vec![clip],
+                    muted: false,
                 });
                 let track_idx = self.tracks.len() - 1;
                 self.undo_manager.push(undo::UndoAction::GenerateClickTrack {
@@ -1176,7 +1194,11 @@ impl App {
         let label_w_phys = Self::TRACK_LABEL_LP * scale;
         if !self.tracks.is_empty() {
             for idx in 0..self.tracks.len() {
-                let label = format!("T{}", idx + 1);
+                let label = if self.tracks[idx].muted {
+                    format!("M{}", idx + 1)
+                } else {
+                    format!("T{}", idx + 1)
+                };
                 let mut buffer = Buffer::new(font_system, Metrics::new(font_size_phys, line_height_phys));
                 buffer.set_size(font_system, Some(label_w_phys), Some(line_height_phys * 2.0));
                 buffer.set_text(font_system, &label, &Attrs::new().family(Family::SansSerif), Shaping::Advanced, None);
@@ -1266,7 +1288,11 @@ impl App {
                         right: label_w_phys as i32,
                         bottom: (lane_top_px + lane_height_px) as i32,
                     },
-                    default_color: GlyphonColor::rgb(160, 160, 170),
+                    default_color: if self.tracks[idx].muted {
+                        GlyphonColor::rgb(200, 100, 100)
+                    } else {
+                        GlyphonColor::rgb(160, 160, 170)
+                    },
                     custom_glyphs: &[],
                 });
             }
@@ -1614,7 +1640,7 @@ impl ApplicationHandler for App {
                 let prev_sel_track = self.selected_track;
                 let prev_sel_clip = self.selected_clip;
                 let insert_at = self.selected_track.map_or(self.tracks.len(), |i| i + 1);
-                self.tracks.insert(insert_at, audio::Track { clips: vec![] });
+                self.tracks.insert(insert_at, audio::Track { clips: vec![], muted: false });
                 self.undo_manager.push(undo::UndoAction::CreateTrack {
                     track_idx: insert_at, prev_sel_track, prev_sel_clip,
                 });
@@ -1700,6 +1726,20 @@ impl ApplicationHandler for App {
                 if let Some(player) = &self.player {
                     player.toggle();
                     self.window.as_ref().unwrap().request_redraw();
+                }
+            }
+            // M: Toggle mute on selected track
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && event.physical_key == PhysicalKey::Code(KeyCode::KeyM)
+                    && !self.modifiers.super_key() =>
+            {
+                if let Some(track_idx) = self.selected_track {
+                    if track_idx < self.tracks.len() {
+                        self.tracks[track_idx].muted = !self.tracks[track_idx].muted;
+                        self.rebuild_player();
+                        self.window.as_ref().unwrap().request_redraw();
+                    }
                 }
             }
             WindowEvent::KeyboardInput { event, .. }

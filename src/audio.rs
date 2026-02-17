@@ -125,6 +125,7 @@ impl Clip {
 #[derive(Clone)]
 pub struct Track {
     pub clips: Vec<Clip>,
+    pub muted: bool,
 }
 
 impl Track {

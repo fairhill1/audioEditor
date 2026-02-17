@@ -135,7 +135,7 @@ pub fn load_project(ron_path: &Path) -> Result<(Vec<audio::Track>, u32), Box<dyn
             });
         }
 
-        tracks.push(audio::Track { clips });
+        tracks.push(audio::Track { clips, muted: false });
     }
 
     Ok((tracks, project.rate))
