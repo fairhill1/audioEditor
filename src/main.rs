@@ -1194,11 +1194,7 @@ impl App {
         let label_w_phys = Self::TRACK_LABEL_LP * scale;
         if !self.tracks.is_empty() {
             for idx in 0..self.tracks.len() {
-                let label = if self.tracks[idx].muted {
-                    format!("M{}", idx + 1)
-                } else {
-                    format!("T{}", idx + 1)
-                };
+                let label = format!("T{}", idx + 1);
                 let mut buffer = Buffer::new(font_system, Metrics::new(font_size_phys, line_height_phys));
                 buffer.set_size(font_system, Some(label_w_phys), Some(line_height_phys * 2.0));
                 buffer.set_text(font_system, &label, &Attrs::new().family(Family::SansSerif), Shaping::Advanced, None);
