@@ -185,6 +185,8 @@ impl App {
         self.viewport = Some(viewport);
     }
 
+    /// Height of the scrollbar in logical pixels
+    const SCROLLBAR_LP: f32 = 8.0;
     /// Height of the title bar in logical pixels
     const TITLE_BAR_LP: f32 = 28.0;
     /// Font size in logical pixels
@@ -319,6 +321,41 @@ impl App {
                     ]);
                 }
             }
+        }
+
+        // Scrollbar at bottom
+        let max_dur = self.max_duration();
+        if max_dur > 0.0 {
+            let scrollbar_h = Self::SCROLLBAR_LP * self.scale_factor();
+            let bar_ndc_h = scrollbar_h / height as f32 * 2.0;
+
+            // Track background (full width, dark)
+            let track_bg = [0.15, 0.15, 0.18];
+            let bar_top = -1.0 + bar_ndc_h;
+            let bar_bot = -1.0_f32;
+            vertices.extend_from_slice(&[
+                Vertex { position: [-1.0, bar_top], color: track_bg },
+                Vertex { position: [1.0, bar_top], color: track_bg },
+                Vertex { position: [-1.0, bar_bot], color: track_bg },
+                Vertex { position: [-1.0, bar_bot], color: track_bg },
+                Vertex { position: [1.0, bar_top], color: track_bg },
+                Vertex { position: [1.0, bar_bot], color: track_bg },
+            ]);
+
+            // Thumb (shows visible portion)
+            let thumb_left = (view_start / max_dur) as f32;
+            let thumb_right = ((view_start + view_duration) / max_dur) as f32;
+            let thumb_x0 = thumb_left * 2.0 - 1.0;
+            let thumb_x1 = thumb_right * 2.0 - 1.0;
+            let thumb_color = [0.4, 0.4, 0.45];
+            vertices.extend_from_slice(&[
+                Vertex { position: [thumb_x0, bar_top], color: thumb_color },
+                Vertex { position: [thumb_x1, bar_top], color: thumb_color },
+                Vertex { position: [thumb_x0, bar_bot], color: thumb_color },
+                Vertex { position: [thumb_x0, bar_bot], color: thumb_color },
+                Vertex { position: [thumb_x1, bar_top], color: thumb_color },
+                Vertex { position: [thumb_x1, bar_bot], color: thumb_color },
+            ]);
         }
 
         // Playhead
