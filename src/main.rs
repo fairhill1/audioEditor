@@ -583,6 +583,25 @@ impl ApplicationHandler for App {
                     self.window.as_ref().unwrap().request_redraw();
                 }
             }
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && matches!(
+                        event.physical_key,
+                        PhysicalKey::Code(KeyCode::ArrowLeft) | PhysicalKey::Code(KeyCode::ArrowRight)
+                    ) =>
+            {
+                if let Some(player) = &self.player {
+                    let max_dur = self.max_duration();
+                    if max_dur > 0.0 {
+                        let step = if self.modifiers.shift_key() { 0.1 } else { 1.0 };
+                        let dir = if event.physical_key == PhysicalKey::Code(KeyCode::ArrowLeft) { -1.0 } else { 1.0 };
+                        let cur_secs = player.position_frac() * max_dur;
+                        let new_secs = (cur_secs + dir * step).clamp(0.0, max_dur);
+                        player.seek_frac(new_secs / max_dur);
+                        self.window.as_ref().unwrap().request_redraw();
+                    }
+                }
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_x = position.x;
                 self.cursor_y = position.y;
