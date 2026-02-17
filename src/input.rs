@@ -506,7 +506,9 @@ impl ApplicationHandler for App {
                 if let Some(track_idx) = self.selected_track {
                     if track_idx < self.tracks.len() {
                         self.tracks[track_idx].muted = !self.tracks[track_idx].muted;
+                        self.undo_manager.push(undo::UndoAction::ToggleMute { track_idx });
                         self.rebuild_player();
+                        self.update_title();
                         self.window.as_ref().unwrap().request_redraw();
                     }
                 }

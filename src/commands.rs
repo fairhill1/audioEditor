@@ -298,6 +298,10 @@ impl App {
                     prev_sel_clip: cur_sel_clip,
                 }
             }
+            undo::UndoAction::ToggleMute { track_idx } => {
+                self.tracks[track_idx].muted = !self.tracks[track_idx].muted;
+                undo::UndoAction::ToggleMute { track_idx }
+            }
         }
     }
 

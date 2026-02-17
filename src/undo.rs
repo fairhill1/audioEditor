@@ -72,6 +72,9 @@ pub enum UndoAction {
         prev_sel_track: Option<usize>,
         prev_sel_clip: Option<usize>,
     },
+    ToggleMute {
+        track_idx: usize,
+    },
 }
 
 pub struct UndoManager {
