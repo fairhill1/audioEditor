@@ -1,4 +1,4 @@
-use crate::app::App;
+use crate::app::{App, SelectionEdge, SELECTION_EDGE_PX};
 
 impl App {
     /// Hit-test: find which (track_idx, clip_idx) is at pixel position (px, py)
@@ -67,6 +67,30 @@ impl App {
     pub(crate) fn px_to_secs(&self, px: f64) -> f64 {
         let config = self.config.as_ref().unwrap();
         self.view_start + (px / config.width as f64) * self.effective_view_duration()
+    }
+
+    /// Convert seconds to pixel X position
+    pub(crate) fn secs_to_px(&self, secs: f64) -> f64 {
+        let config = self.config.as_ref().unwrap();
+        (secs - self.view_start) / self.effective_view_duration() * config.width as f64
+    }
+
+    /// Check if a pixel X is near a selection edge, returning which edge
+    pub(crate) fn hit_test_selection_edge(&self, px: f64) -> Option<SelectionEdge> {
+        let (s0, s1) = self.selection?;
+        let left_px = self.secs_to_px(s0);
+        let right_px = self.secs_to_px(s1);
+        let threshold = SELECTION_EDGE_PX;
+        // Prefer whichever edge is closer
+        let d_left = (px - left_px).abs();
+        let d_right = (px - right_px).abs();
+        if d_left <= threshold && d_left <= d_right {
+            Some(SelectionEdge::Left)
+        } else if d_right <= threshold {
+            Some(SelectionEdge::Right)
+        } else {
+            None
+        }
     }
 
     /// Snap a clip's offset to nearby clip edges in the same track.

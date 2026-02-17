@@ -7,7 +7,7 @@ use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorIcon, Window, WindowId};
 
-use crate::app::{App, DragState, DRAG_THRESHOLD_PX};
+use crate::app::{App, DragState, SelectionEdge, DRAG_THRESHOLD_PX};
 use crate::{audio, modal, undo};
 
 impl ApplicationHandler for App {
@@ -170,10 +170,21 @@ impl ApplicationHandler for App {
                     && event.physical_key == PhysicalKey::Code(KeyCode::KeyC)
                     && self.modifiers.super_key() =>
             {
-                if let (Some((s0, s1)), Some(track_idx), Some(clip_idx)) =
-                    (self.selection, self.selected_track, self.selected_clip)
+                if let (Some((s0, s1)), Some(track_idx)) =
+                    (self.selection, self.selected_track)
                 {
-                    // Copy selection region from selected clip
+                    let clip_idx = self.selected_clip.or_else(|| {
+                        if track_idx < self.tracks.len() {
+                            self.tracks[track_idx].clips.iter().position(|c| {
+                                let c_end = c.offset_secs + c.duration_secs();
+                                s0 < c_end && s1 > c.offset_secs
+                            })
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(clip_idx) = clip_idx {
+                    // Copy selection region from clip
                     if track_idx < self.tracks.len() && clip_idx < self.tracks[track_idx].clips.len() {
                         let clip = &self.tracks[track_idx].clips[clip_idx];
                         let rel_start = (s0 - clip.offset_secs).max(0.0);
@@ -183,6 +194,7 @@ impl ApplicationHandler for App {
                             sliced.offset_secs = 0.0;
                             self.clipboard = Some(sliced);
                         }
+                    }
                     }
                 } else if let (Some(track_idx), Some(clip_idx)) = (self.selected_track, self.selected_clip) {
                     if track_idx < self.tracks.len() && clip_idx < self.tracks[track_idx].clips.len() {
@@ -196,9 +208,20 @@ impl ApplicationHandler for App {
                     && event.physical_key == PhysicalKey::Code(KeyCode::KeyX)
                     && self.modifiers.super_key() =>
             {
-                if let (Some((s0, s1)), Some(track_idx), Some(clip_idx)) =
-                    (self.selection, self.selected_track, self.selected_clip)
+                if let (Some((s0, s1)), Some(track_idx)) =
+                    (self.selection, self.selected_track)
                 {
+                    let clip_idx = self.selected_clip.or_else(|| {
+                        if track_idx < self.tracks.len() {
+                            self.tracks[track_idx].clips.iter().position(|c| {
+                                let c_end = c.offset_secs + c.duration_secs();
+                                s0 < c_end && s1 > c.offset_secs
+                            })
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(clip_idx) = clip_idx {
                     if track_idx < self.tracks.len() && clip_idx < self.tracks[track_idx].clips.len() {
                         let clip = &self.tracks[track_idx].clips[clip_idx];
                         let rel_start = (s0 - clip.offset_secs).max(0.0);
@@ -240,6 +263,7 @@ impl ApplicationHandler for App {
                             self.rebuild_player();
                             self.window.as_ref().unwrap().request_redraw();
                         }
+                    }
                     }
                 } else if let (Some(track_idx), Some(clip_idx)) = (self.selected_track, self.selected_clip) {
                     if track_idx < self.tracks.len() && clip_idx < self.tracks[track_idx].clips.len() {
@@ -348,7 +372,64 @@ impl ApplicationHandler for App {
                     && event.physical_key == PhysicalKey::Code(KeyCode::Backspace)
                     && !self.tracks.is_empty() =>
             {
-                if let (Some(track_idx), Some(clip_idx)) = (self.selected_track, self.selected_clip) {
+                if let (Some((s0, s1)), Some(track_idx)) =
+                    (self.selection, self.selected_track)
+                {
+                    // Find clip overlapping the selection if none explicitly selected
+                    let clip_idx = self.selected_clip.or_else(|| {
+                        if track_idx < self.tracks.len() {
+                            self.tracks[track_idx].clips.iter().position(|c| {
+                                let c_end = c.offset_secs + c.duration_secs();
+                                s0 < c_end && s1 > c.offset_secs
+                            })
+                        } else {
+                            None
+                        }
+                    });
+                    // Delete selected region from clip
+                    if let Some(clip_idx) = clip_idx {
+                    if track_idx < self.tracks.len() && clip_idx < self.tracks[track_idx].clips.len() {
+                        let clip = &self.tracks[track_idx].clips[clip_idx];
+                        let rel_start = (s0 - clip.offset_secs).max(0.0);
+                        let rel_end = (s1 - clip.offset_secs).min(clip.duration_secs());
+                        if rel_end > rel_start {
+                            let prev_sel_clip = self.selected_clip;
+                            let prev_selection = self.selection;
+                            let original_clip = self.tracks[track_idx].clips[clip_idx].clone();
+
+                            let (left, right) = clip.remove_region(rel_start, rel_end);
+                            self.tracks[track_idx].clips.remove(clip_idx);
+                            let mut num_pieces = 0;
+                            let mut insert_at = clip_idx;
+                            if let Some(l) = left {
+                                self.tracks[track_idx].clips.insert(insert_at, l);
+                                insert_at += 1;
+                                num_pieces += 1;
+                            }
+                            if let Some(r) = right {
+                                self.tracks[track_idx].clips.insert(insert_at, r);
+                                num_pieces += 1;
+                            }
+
+                            self.undo_manager.push(undo::UndoAction::DeleteRegion {
+                                track_idx, clip_idx, original_clip,
+                                num_pieces, prev_sel_clip, prev_selection,
+                            });
+                            self.selection = None;
+
+                            if self.tracks[track_idx].clips.is_empty() {
+                                self.selected_clip = None;
+                            } else {
+                                self.selected_clip = Some(clip_idx.min(self.tracks[track_idx].clips.len() - 1));
+                            }
+                            self.rebuild_player();
+                            self.update_title();
+                            self.window.as_ref().unwrap().request_redraw();
+                        }
+                    }
+                    }
+                } else if let (Some(track_idx), Some(clip_idx)) = (self.selected_track, self.selected_clip) {
+                    // No selection — delete entire clip
                     if track_idx < self.tracks.len() && clip_idx < self.tracks[track_idx].clips.len() {
                         let prev_sel_track = self.selected_track;
                         let prev_sel_clip = self.selected_clip;
@@ -454,11 +535,15 @@ impl ApplicationHandler for App {
                 self.cursor_x = position.x;
                 self.cursor_y = position.y;
 
-                // Update selection end while dragging out a selection
+                // Update selection while dragging
                 if self.selecting {
                     let secs = self.px_to_secs(position.x);
                     if let Some(sel) = &mut self.selection {
-                        sel.1 = secs;
+                        match self.selecting_edge {
+                            Some(SelectionEdge::Left) => sel.0 = secs,
+                            Some(SelectionEdge::Right) => sel.1 = secs,
+                            None => sel.1 = secs,
+                        }
                     }
                     self.window.as_ref().unwrap().request_redraw();
                 }
@@ -480,6 +565,8 @@ impl ApplicationHandler for App {
                     self.window.as_ref().unwrap().set_cursor(CursorIcon::Grabbing);
                 } else if self.hit_test_title_bar(position.x, position.y).is_some() {
                     self.window.as_ref().unwrap().set_cursor(CursorIcon::Grab);
+                } else if self.hit_test_selection_edge(position.x).is_some() {
+                    self.window.as_ref().unwrap().set_cursor(CursorIcon::EwResize);
                 } else {
                     self.window.as_ref().unwrap().set_cursor(CursorIcon::Text);
                 }
@@ -559,11 +646,17 @@ impl ApplicationHandler for App {
                         prev_selected_track: self.selected_track,
                         prev_selected_clip: self.selected_clip,
                     });
+                } else if let Some(edge) = self.hit_test_selection_edge(self.cursor_x) {
+                    // Click near selection edge → resize existing selection
+                    self.selecting = true;
+                    self.selecting_edge = Some(edge);
+                    self.dragging = None;
                 } else {
                     // Click on waveform body or empty area → start selection
                     let click_secs = self.px_to_secs(self.cursor_x);
                     self.selection = Some((click_secs, click_secs));
                     self.selecting = true;
+                    self.selecting_edge = None;
                     self.dragging = None;
 
                     // Select track from Y position
@@ -599,6 +692,7 @@ impl ApplicationHandler for App {
                 // Finalize selection
                 if self.selecting {
                     self.selecting = false;
+                    self.selecting_edge = None;
                     // Use pixel distance to decide if it was a real drag or just a click
                     if let (Some((a, b)), Some(config)) = (self.selection, self.config.as_ref()) {
                         let px_a = (a - self.view_start) / self.effective_view_duration() * config.width as f64;

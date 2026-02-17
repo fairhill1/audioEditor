@@ -24,6 +24,14 @@ pub enum UndoAction {
         prev_clipboard: Option<audio::Clip>,
         prev_sel_clip: Option<usize>,
     },
+    DeleteRegion {
+        track_idx: usize,
+        clip_idx: usize,
+        original_clip: audio::Clip,
+        num_pieces: usize,
+        prev_sel_clip: Option<usize>,
+        prev_selection: Option<(f64, f64)>,
+    },
     PasteClip {
         track_idx: usize,
         clip_idx: usize,

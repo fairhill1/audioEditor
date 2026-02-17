@@ -101,6 +101,28 @@ impl App {
                     prev_sel_clip: cur_sel_clip,
                 }
             }
+            undo::UndoAction::DeleteRegion {
+                track_idx, clip_idx, original_clip, num_pieces,
+                prev_sel_clip, prev_selection,
+            } => {
+                // Undo delete-region: remove the pieces and restore original clip
+                let cur_sel_clip = self.selected_clip;
+                let cur_selection = self.selection;
+                for _ in 0..num_pieces {
+                    self.tracks[track_idx].clips.remove(clip_idx);
+                }
+                self.tracks[track_idx].clips.insert(clip_idx, original_clip.clone());
+                self.selected_track = Some(track_idx);
+                self.selected_clip = prev_sel_clip;
+                self.selection = prev_selection;
+                // Reverse: delete the region again
+                undo::UndoAction::DeleteRegion {
+                    track_idx, clip_idx, original_clip,
+                    num_pieces,
+                    prev_sel_clip: cur_sel_clip,
+                    prev_selection: cur_selection,
+                }
+            }
             undo::UndoAction::PasteClip {
                 track_idx, clip_idx, prev_sel_clip,
             } => {
@@ -435,8 +457,11 @@ impl App {
                     self.selected_clip = Some(0);
                 }
 
-                self.view_duration = self.max_duration();
-                self.view_start = 0.0;
+                // Only reset zoom if this is the first clip in the project
+                if self.tracks.iter().map(|t| t.clips.len()).sum::<usize>() == 1 {
+                    self.view_duration = self.max_duration();
+                    self.view_start = 0.0;
+                }
                 self.rebuild_player();
             }
             self.update_title();

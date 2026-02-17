@@ -49,6 +49,13 @@ pub(crate) struct DragState {
 }
 
 pub(crate) const DRAG_THRESHOLD_PX: f64 = 4.0;
+pub(crate) const SELECTION_EDGE_PX: f64 = 6.0;
+
+#[derive(Clone, Copy)]
+pub(crate) enum SelectionEdge {
+    Left,
+    Right,
+}
 
 pub(crate) struct App {
     pub(crate) window: Option<Arc<Window>>,
@@ -75,6 +82,7 @@ pub(crate) struct App {
     pub(crate) dragging: Option<DragState>,
     pub(crate) selection: Option<(f64, f64)>,
     pub(crate) selecting: bool,
+    pub(crate) selecting_edge: Option<SelectionEdge>,
     pub(crate) clipboard: Option<audio::Clip>,
     pub(crate) undo_manager: undo::UndoManager,
     // Text rendering (glyphon)
@@ -112,6 +120,7 @@ impl App {
             dragging: None,
             selection: None,
             selecting: false,
+            selecting_edge: None,
             clipboard: None,
             undo_manager: undo::UndoManager::new(100),
             font_system: None,
