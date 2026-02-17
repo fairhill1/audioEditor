@@ -238,6 +238,8 @@ impl App {
     const SCROLLBAR_LP: f32 = 8.0;
     /// Height of the title bar in logical pixels
     const TITLE_BAR_LP: f32 = 28.0;
+    /// Width of the track label column in logical pixels
+    const TRACK_LABEL_LP: f32 = 36.0;
     /// Font size in logical pixels
     const FONT_SIZE_LP: f32 = 14.0;
     /// Line height in logical pixels
@@ -472,6 +474,16 @@ impl App {
                 push_quad(&mut vertices, -1.0, lane_top - line_h, 1.0, lane_top + line_h, DIVIDER_COLOR);
             }
 
+            // Track label background (far left column)
+            let label_w_physical = Self::TRACK_LABEL_LP * self.scale_factor();
+            let label_x1_ndc = -1.0 + label_w_physical / width as f32 * 2.0;
+            let label_bg = if self.selected_track == Some(idx) {
+                [0.22, 0.22, 0.28]
+            } else {
+                [0.15, 0.15, 0.18]
+            };
+            push_quad(&mut vertices, -1.0, lane_bot, label_x1_ndc, lane_top, label_bg);
+
             // Draw each clip in this track
             for (clip_idx, clip) in track.clips.iter().enumerate() {
                 let is_selected = self.selected_track == Some(idx) && self.selected_clip == Some(clip_idx);
@@ -538,8 +550,8 @@ impl App {
                     let x0 = (x_offset + col as f32 / width as f32) * 2.0 - 1.0;
                     let x1 = (x_offset + (col + 1) as f32 / width as f32) * 2.0 - 1.0;
 
-                    let y_top = wave_center + max_val * half_wave;
-                    let y_bot = wave_center + min_val * half_wave;
+                    let y_top = (wave_center + max_val * half_wave).min(wave_top);
+                    let y_bot = (wave_center + min_val * half_wave).max(wave_bot);
 
                     push_quad(&mut vertices, x0, y_bot, x1, y_top, color);
                 }
@@ -778,6 +790,20 @@ impl App {
             }
         }
 
+        // Track label text buffers ("T1", "T2", etc.)
+        let track_label_start_idx = text_buffers.len();
+        let label_w_phys = Self::TRACK_LABEL_LP * scale;
+        if !self.tracks.is_empty() {
+            for idx in 0..self.tracks.len() {
+                let label = format!("T{}", idx + 1);
+                let mut buffer = Buffer::new(font_system, Metrics::new(font_size_phys, line_height_phys));
+                buffer.set_size(font_system, Some(label_w_phys), Some(line_height_phys * 2.0));
+                buffer.set_text(font_system, &label, &Attrs::new().family(Family::SansSerif), Shaping::Advanced, None);
+                buffer.shape_until_scroll(font_system, false);
+                text_buffers.push(buffer);
+            }
+        }
+
         // Modal text buffers (title + input)
         let modal_title_idx;
         let modal_input_idx;
@@ -839,6 +865,27 @@ impl App {
                         bottom: (lane_top + title_bar_phys) as i32,
                     },
                     default_color: GlyphonColor::rgb(220, 220, 220),
+                    custom_glyphs: &[],
+                });
+            }
+
+            // Track label text areas
+            for idx in 0..num_tracks {
+                let buf_idx = track_label_start_idx + idx;
+                let lane_top_px = idx as f32 * lane_height_px;
+                let vert_center = lane_top_px + lane_height_px / 2.0 - line_height_phys / 2.0;
+                text_areas.push(TextArea {
+                    buffer: &text_buffers[buf_idx],
+                    left: padding_phys * 0.5,
+                    top: vert_center,
+                    scale: 1.0,
+                    bounds: TextBounds {
+                        left: 0,
+                        top: lane_top_px as i32,
+                        right: label_w_phys as i32,
+                        bottom: (lane_top_px + lane_height_px) as i32,
+                    },
+                    default_color: GlyphonColor::rgb(160, 160, 170),
                     custom_glyphs: &[],
                 });
             }
