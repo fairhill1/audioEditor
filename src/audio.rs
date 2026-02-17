@@ -86,6 +86,50 @@ impl Clip {
         }
     }
 
+    /// Extract a sub-range of this clip (start_secs..end_secs relative to clip start)
+    /// and return it as a new Clip. The original clip is not modified.
+    pub fn slice(&self, start_secs: f64, end_secs: f64) -> Clip {
+        let mono_start = (start_secs * self.sample_rate as f64) as usize;
+        let mono_end = ((end_secs * self.sample_rate as f64) as usize).min(self.mono.len());
+        let sample_start = mono_start * self.channels as usize;
+        let sample_end = (mono_end * self.channels as usize).min(self.samples.len());
+
+        let samples = self.samples[sample_start..sample_end].to_vec();
+        let mono = self.mono[mono_start..mono_end].to_vec();
+        let summary = Self::build_summary(&mono);
+
+        Clip {
+            name: self.name.clone(),
+            samples,
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+            mono,
+            summary,
+            offset_secs: self.offset_secs + start_secs,
+            source_path: self.source_path.clone(),
+        }
+    }
+
+    /// Remove the region start_secs..end_secs (relative to clip start) and return
+    /// the left and right pieces. Either piece may be empty.
+    pub fn remove_region(&self, start_secs: f64, end_secs: f64) -> (Option<Clip>, Option<Clip>) {
+        let left = if start_secs > 0.0 {
+            let c = self.slice(0.0, start_secs);
+            if c.mono.is_empty() { None } else { Some(c) }
+        } else {
+            None
+        };
+        let dur = self.duration_secs();
+        let right = if end_secs < dur {
+            let mut c = self.slice(end_secs, dur);
+            c.offset_secs = self.offset_secs + end_secs;
+            if c.mono.is_empty() { None } else { Some(c) }
+        } else {
+            None
+        };
+        (left, right)
+    }
+
     /// Get min/max for a range of mono samples, using the summary where possible
     pub fn min_max_range(&self, start: usize, end: usize) -> (f32, f32) {
         let mut min_val = 0.0_f32;

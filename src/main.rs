@@ -17,7 +17,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorIcon, Window, WindowId};
 
 /// Set up a macOS Edit menu with standard text-editing key equivalents so that
 /// Cmd+C/V/X/A work inside native panels (e.g. the file-open dialog search field).
@@ -127,6 +127,8 @@ struct App {
     project_rate: u32,
     loading: Option<PendingLoad>,
     dragging: Option<DragState>,
+    selection: Option<(f64, f64)>,
+    selecting: bool,
     clipboard: Option<audio::Clip>,
     undo_manager: undo::UndoManager,
     // Text rendering (glyphon)
@@ -162,6 +164,8 @@ impl App {
             project_rate: 48_000,
             loading: None,
             dragging: None,
+            selection: None,
+            selecting: false,
             clipboard: None,
             undo_manager: undo::UndoManager::new(100),
             font_system: None,
@@ -348,6 +352,46 @@ impl App {
             }
         }
         None
+    }
+
+    /// Hit-test: check if pixel position (px, py) is in a clip's title bar
+    fn hit_test_title_bar(&self, px: f64, py: f64) -> Option<(usize, usize)> {
+        if self.tracks.is_empty() {
+            return None;
+        }
+        let config = self.config.as_ref()?;
+        let num_tracks = self.tracks.len();
+        let lane_height_px = config.height as f64 / num_tracks as f64;
+        let track_idx = (py / lane_height_px) as usize;
+        if track_idx >= num_tracks {
+            return None;
+        }
+
+        let lane_top_px = track_idx as f64 * lane_height_px;
+        let title_bar_physical = Self::TITLE_BAR_LP as f64 * self.scale_factor() as f64;
+        if py - lane_top_px >= title_bar_physical {
+            return None;
+        }
+
+        let view_start = self.view_start;
+        let view_duration = self.effective_view_duration();
+        let cursor_secs = view_start + (px / config.width as f64) * view_duration;
+
+        let track = &self.tracks[track_idx];
+        for (clip_idx, clip) in track.clips.iter().enumerate() {
+            let clip_start = clip.offset_secs;
+            let clip_end = clip.offset_secs + clip.duration_secs();
+            if cursor_secs >= clip_start && cursor_secs <= clip_end {
+                return Some((track_idx, clip_idx));
+            }
+        }
+        None
+    }
+
+    /// Convert a pixel X position to seconds on the timeline
+    fn px_to_secs(&self, px: f64) -> f64 {
+        let config = self.config.as_ref().unwrap();
+        self.view_start + (px / config.width as f64) * self.effective_view_duration()
     }
 
     /// Snap a clip's offset to nearby clip edges in the same track.
@@ -548,6 +592,20 @@ impl App {
                 [0.15, 0.15, 0.18]
             };
             push_quad(&mut vertices, -1.0, lane_bot, label_x1_ndc, lane_top, label_bg);
+
+            // Selection highlight (behind waveforms, only on selected track)
+            if self.selected_track == Some(idx) {
+                if let Some((sel_start, sel_end)) = self.selection {
+                    let (s0, s1) = if sel_start <= sel_end { (sel_start, sel_end) } else { (sel_end, sel_start) };
+                    let x0_frac = ((s0 - view_start) / view_duration) as f32;
+                    let x1_frac = ((s1 - view_start) / view_duration) as f32;
+                    if x1_frac > 0.0 && x0_frac < 1.0 {
+                        let x0 = x0_frac.max(0.0) * 2.0 - 1.0;
+                        let x1 = x1_frac.min(1.0) * 2.0 - 1.0;
+                        push_quad(&mut vertices, x0, wave_bot, x1, wave_top, [0.15, 0.20, 0.35]);
+                    }
+                }
+            }
 
             // Draw each clip in this track
             for (clip_idx, clip) in track.clips.iter().enumerate() {
@@ -1600,25 +1658,84 @@ impl ApplicationHandler for App {
             {
                 self.perform_undo();
             }
-            // Cmd+C: Copy selected clip
+            // Cmd+C: Copy selected clip (or selection region)
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed
                     && event.physical_key == PhysicalKey::Code(KeyCode::KeyC)
                     && self.modifiers.super_key() =>
             {
-                if let (Some(track_idx), Some(clip_idx)) = (self.selected_track, self.selected_clip) {
+                if let (Some((s0, s1)), Some(track_idx), Some(clip_idx)) =
+                    (self.selection, self.selected_track, self.selected_clip)
+                {
+                    // Copy selection region from selected clip
+                    if track_idx < self.tracks.len() && clip_idx < self.tracks[track_idx].clips.len() {
+                        let clip = &self.tracks[track_idx].clips[clip_idx];
+                        let rel_start = (s0 - clip.offset_secs).max(0.0);
+                        let rel_end = (s1 - clip.offset_secs).min(clip.duration_secs());
+                        if rel_end > rel_start {
+                            let mut sliced = clip.slice(rel_start, rel_end);
+                            sliced.offset_secs = 0.0;
+                            self.clipboard = Some(sliced);
+                        }
+                    }
+                } else if let (Some(track_idx), Some(clip_idx)) = (self.selected_track, self.selected_clip) {
                     if track_idx < self.tracks.len() && clip_idx < self.tracks[track_idx].clips.len() {
                         self.clipboard = Some(self.tracks[track_idx].clips[clip_idx].clone());
                     }
                 }
             }
-            // Cmd+X: Cut selected clip
+            // Cmd+X: Cut selected clip (or selection region)
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed
                     && event.physical_key == PhysicalKey::Code(KeyCode::KeyX)
                     && self.modifiers.super_key() =>
             {
-                if let (Some(track_idx), Some(clip_idx)) = (self.selected_track, self.selected_clip) {
+                if let (Some((s0, s1)), Some(track_idx), Some(clip_idx)) =
+                    (self.selection, self.selected_track, self.selected_clip)
+                {
+                    if track_idx < self.tracks.len() && clip_idx < self.tracks[track_idx].clips.len() {
+                        let clip = &self.tracks[track_idx].clips[clip_idx];
+                        let rel_start = (s0 - clip.offset_secs).max(0.0);
+                        let rel_end = (s1 - clip.offset_secs).min(clip.duration_secs());
+                        if rel_end > rel_start {
+                            let prev_clipboard = self.clipboard.clone();
+                            let prev_sel_clip = self.selected_clip;
+                            let original_clip = self.tracks[track_idx].clips[clip_idx].clone();
+
+                            // Copy the selection to clipboard
+                            let mut sliced = clip.slice(rel_start, rel_end);
+                            sliced.offset_secs = 0.0;
+
+                            // Remove the region — replace original clip with left + right pieces
+                            let (left, right) = clip.remove_region(rel_start, rel_end);
+                            self.tracks[track_idx].clips.remove(clip_idx);
+                            let mut insert_at = clip_idx;
+                            if let Some(l) = left {
+                                self.tracks[track_idx].clips.insert(insert_at, l);
+                                insert_at += 1;
+                            }
+                            if let Some(r) = right {
+                                self.tracks[track_idx].clips.insert(insert_at, r);
+                            }
+
+                            // Store original clip for undo — use CutClip with the whole original
+                            self.undo_manager.push(undo::UndoAction::CutClip {
+                                track_idx, clip_idx, clip: original_clip,
+                                prev_clipboard, prev_sel_clip,
+                            });
+                            self.clipboard = Some(sliced);
+                            self.selection = None;
+
+                            if self.tracks[track_idx].clips.is_empty() {
+                                self.selected_clip = None;
+                            } else {
+                                self.selected_clip = Some(clip_idx.min(self.tracks[track_idx].clips.len() - 1));
+                            }
+                            self.rebuild_player();
+                            self.window.as_ref().unwrap().request_redraw();
+                        }
+                    }
+                } else if let (Some(track_idx), Some(clip_idx)) = (self.selected_track, self.selected_clip) {
                     if track_idx < self.tracks.len() && clip_idx < self.tracks[track_idx].clips.len() {
                         let prev_clipboard = self.clipboard.clone();
                         let prev_sel_clip = self.selected_clip;
@@ -1761,12 +1878,35 @@ impl ApplicationHandler for App {
                     }
                 }
             }
+            // Escape: clear selection
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && event.physical_key == PhysicalKey::Code(KeyCode::Escape) =>
+            {
+                if self.selection.is_some() {
+                    self.selection = None;
+                    self.selecting = false;
+                    self.window.as_ref().unwrap().request_redraw();
+                }
+            }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed
                     && event.physical_key == PhysicalKey::Code(KeyCode::Space) =>
             {
                 if let Some(player) = &self.player {
-                    player.toggle();
+                    let max_dur = self.max_duration();
+                    if player.is_playing() {
+                        player.toggle();
+                    } else {
+                        // If there's a selection, seek to start and set end
+                        if let Some((s0, s1)) = self.selection {
+                            player.seek_to_secs(s0, max_dur);
+                            player.set_end_secs(s1, max_dur);
+                        } else {
+                            player.set_end_secs(0.0, max_dur);
+                        }
+                        player.toggle();
+                    }
                     self.window.as_ref().unwrap().request_redraw();
                 }
             }
@@ -1808,6 +1948,15 @@ impl ApplicationHandler for App {
                 self.cursor_x = position.x;
                 self.cursor_y = position.y;
 
+                // Update selection end while dragging out a selection
+                if self.selecting {
+                    let secs = self.px_to_secs(position.x);
+                    if let Some(sel) = &mut self.selection {
+                        sel.1 = secs;
+                    }
+                    self.window.as_ref().unwrap().request_redraw();
+                }
+
                 // Handle clip dragging
                 if let Some(drag) = &mut self.dragging {
                     if !drag.active {
@@ -1819,6 +1968,16 @@ impl ApplicationHandler for App {
                         }
                     }
                 }
+
+                // Update cursor icon
+                if self.dragging.as_ref().is_some_and(|d| d.active) {
+                    self.window.as_ref().unwrap().set_cursor(CursorIcon::Grabbing);
+                } else if self.hit_test_title_bar(position.x, position.y).is_some() {
+                    self.window.as_ref().unwrap().set_cursor(CursorIcon::Grab);
+                } else {
+                    self.window.as_ref().unwrap().set_cursor(CursorIcon::Text);
+                }
+
                 if self.dragging.as_ref().is_some_and(|d| d.active) {
                     let config = self.config.as_ref().unwrap();
                     let view_duration = self.effective_view_duration();
@@ -1874,12 +2033,13 @@ impl ApplicationHandler for App {
                 button: winit::event::MouseButton::Left,
                 ..
             } => {
-                // Hit-test for clip selection and potential drag
-                if let Some((track_idx, clip_idx)) = self.hit_test_clip(self.cursor_x, self.cursor_y) {
+                if let Some((track_idx, clip_idx)) = self.hit_test_title_bar(self.cursor_x, self.cursor_y) {
+                    // Title bar click → prepare clip drag
+                    self.selection = None;
+                    self.selecting = false;
                     self.selected_track = Some(track_idx);
                     self.selected_clip = Some(clip_idx);
 
-                    // Prepare drag (not active until cursor moves past threshold)
                     let clip = &self.tracks[track_idx].clips[clip_idx];
                     self.dragging = Some(DragState {
                         clip_idx,
@@ -1893,23 +2053,34 @@ impl ApplicationHandler for App {
                         prev_selected_track: self.selected_track,
                         prev_selected_clip: self.selected_clip,
                     });
-                } else if !self.tracks.is_empty() {
-                    // Click on empty area — select track but deselect clip
-                    if let Some(config) = &self.config {
-                        let track_idx = (self.cursor_y / config.height as f64 * self.tracks.len() as f64) as usize;
-                        self.selected_track = Some(track_idx.min(self.tracks.len() - 1));
+                } else {
+                    // Click on waveform body or empty area → start selection
+                    let click_secs = self.px_to_secs(self.cursor_x);
+                    self.selection = Some((click_secs, click_secs));
+                    self.selecting = true;
+                    self.dragging = None;
+
+                    // Select track from Y position
+                    if !self.tracks.is_empty() {
+                        if let Some(config) = &self.config {
+                            let track_idx = (self.cursor_y / config.height as f64 * self.tracks.len() as f64) as usize;
+                            self.selected_track = Some(track_idx.min(self.tracks.len() - 1));
+                        }
+                    }
+                    // Select clip if clicking on one (but not via title bar)
+                    if let Some((track_idx, clip_idx)) = self.hit_test_clip(self.cursor_x, self.cursor_y) {
+                        self.selected_track = Some(track_idx);
+                        self.selected_clip = Some(clip_idx);
+                    } else {
                         self.selected_clip = None;
                     }
-                }
 
-                // Always seek on click
-                if let (Some(player), Some(config)) = (&self.player, &self.config) {
-                    let cursor_frac = self.cursor_x / config.width as f64;
-                    let view_dur = self.effective_view_duration();
-                    let click_secs = self.view_start + cursor_frac * view_dur;
-                    let max_dur = self.max_duration();
-                    if max_dur > 0.0 {
-                        player.seek_frac(click_secs / max_dur);
+                    // Seek playhead to click position
+                    if let Some(player) = &self.player {
+                        let max_dur = self.max_duration();
+                        if max_dur > 0.0 {
+                            player.seek_frac(click_secs / max_dur);
+                        }
                     }
                 }
                 self.window.as_ref().unwrap().request_redraw();
@@ -1919,6 +2090,23 @@ impl ApplicationHandler for App {
                 button: winit::event::MouseButton::Left,
                 ..
             } => {
+                // Finalize selection
+                if self.selecting {
+                    self.selecting = false;
+                    // Use pixel distance to decide if it was a real drag or just a click
+                    if let (Some((a, b)), Some(config)) = (self.selection, self.config.as_ref()) {
+                        let px_a = (a - self.view_start) / self.effective_view_duration() * config.width as f64;
+                        let px_b = (b - self.view_start) / self.effective_view_duration() * config.width as f64;
+                        if (px_b - px_a).abs() < DRAG_THRESHOLD_PX {
+                            self.selection = None;
+                        } else {
+                            let (start, end) = if a <= b { (a, b) } else { (b, a) };
+                            self.selection = Some((start, end));
+                        }
+                    }
+                    self.window.as_ref().unwrap().request_redraw();
+                }
+
                 if let Some(drag) = self.dragging.take() {
                     if drag.active {
                         let mut sel_track = drag.current_track_idx;
