@@ -11,7 +11,7 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
-pub struct AudioTrack {
+pub struct Clip {
     pub name: String,
     pub samples: Vec<f32>,
     pub sample_rate: u32,
@@ -20,12 +20,14 @@ pub struct AudioTrack {
     pub mono: Vec<f32>,
     /// Pre-computed min/max summary at fixed bucket size for fast rendering
     pub summary: Vec<(f32, f32)>,
+    /// Position of this clip on the timeline in seconds
+    pub offset_secs: f64,
 }
 
 /// Samples per summary bucket — tune for a good balance of detail vs speed
 const SUMMARY_BUCKET: usize = 256;
 
-impl AudioTrack {
+impl Clip {
     pub fn duration_secs(&self) -> f64 {
         self.mono.len() as f64 / self.sample_rate as f64
     }
@@ -93,6 +95,19 @@ impl AudioTrack {
     }
 }
 
+pub struct Track {
+    pub clips: Vec<Clip>,
+}
+
+impl Track {
+    pub fn duration_secs(&self) -> f64 {
+        self.clips
+            .iter()
+            .map(|c| c.offset_secs + c.duration_secs())
+            .fold(0.0_f64, f64::max)
+    }
+}
+
 fn resample(samples: &[f32], channels: u32, from_rate: u32, to_rate: u32, on_progress: &dyn Fn(f32)) -> Vec<f32> {
     let ch = channels as usize;
     let in_frames = samples.len() / ch;
@@ -138,7 +153,7 @@ fn resample(samples: &[f32], channels: u32, from_rate: u32, to_rate: u32, on_pro
     output
 }
 
-pub fn load_file(path: &Path, project_rate: u32, on_progress: &dyn Fn(f32)) -> Result<AudioTrack, Box<dyn std::error::Error>> {
+pub fn load_file(path: &Path, project_rate: u32, on_progress: &dyn Fn(f32)) -> Result<Clip, Box<dyn std::error::Error>> {
     let file = File::open(path)?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
@@ -202,8 +217,8 @@ pub fn load_file(path: &Path, project_rate: u32, on_progress: &dyn Fn(f32)) -> R
         (samples, sample_rate)
     };
 
-    let mono = AudioTrack::build_mono(&samples, channels);
-    let summary = AudioTrack::build_summary(&mono);
+    let mono = Clip::build_mono(&samples, channels);
+    let summary = Clip::build_summary(&mono);
 
     let name = path
         .file_name()
@@ -211,17 +226,18 @@ pub fn load_file(path: &Path, project_rate: u32, on_progress: &dyn Fn(f32)) -> R
         .unwrap_or("Untitled")
         .to_string();
 
-    Ok(AudioTrack {
+    Ok(Clip {
         name,
         samples,
         sample_rate,
         channels,
         mono,
         summary,
+        offset_secs: 0.0,
     })
 }
 
-pub fn generate_click_track(bpm: f64, duration_secs: f64, sample_rate: u32) -> AudioTrack {
+pub fn generate_click_track(bpm: f64, duration_secs: f64, sample_rate: u32) -> Clip {
     let interval_samples = (sample_rate as f64 * 60.0 / bpm) as usize;
     let total_samples = (sample_rate as f64 * duration_secs) as usize;
     let click_len = (sample_rate as f64 * 0.015) as usize; // 15ms click
@@ -244,14 +260,15 @@ pub fn generate_click_track(bpm: f64, duration_secs: f64, sample_rate: u32) -> A
     }
 
     let mono = samples.clone();
-    let summary = AudioTrack::build_summary(&mono);
+    let summary = Clip::build_summary(&mono);
 
-    AudioTrack {
+    Clip {
         name: format!("Click — {bpm} BPM"),
         samples,
         sample_rate,
         channels: 1,
         mono,
         summary,
+        offset_secs: 0.0,
     }
 }

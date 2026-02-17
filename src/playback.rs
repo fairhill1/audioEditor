@@ -4,7 +4,7 @@ use std::sync::Arc;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::Stream;
 
-use crate::audio::AudioTrack;
+use crate::audio::Track;
 
 pub struct PlaybackState {
     pub playing: AtomicBool,
@@ -18,38 +18,53 @@ pub struct Player {
 }
 
 impl Player {
-    pub fn new(tracks: &[AudioTrack]) -> Option<Self> {
+    pub fn new(tracks: &[Track]) -> Option<Self> {
         if tracks.is_empty() {
             return None;
         }
 
-        // Find the common sample rate (use first track's rate) and max length in frames
-        let sample_rate = tracks[0].sample_rate;
-        let max_frames = tracks
-            .iter()
-            .map(|t| t.samples.len() / t.channels as usize)
-            .max()
-            .unwrap_or(0) as u64;
+        // Find the common sample rate (use first clip's rate) and max length in frames
+        let sample_rate = tracks.iter()
+            .flat_map(|t| t.clips.iter())
+            .map(|c| c.sample_rate)
+            .next()?;
+
+        let max_duration_secs = tracks.iter()
+            .map(|t| t.duration_secs())
+            .fold(0.0_f64, f64::max);
+        let max_frames = (max_duration_secs * sample_rate as f64) as u64;
+
+        if max_frames == 0 {
+            return None;
+        }
 
         // Pre-mix all tracks down to stereo interleaved f32
         let total_samples = max_frames as usize * 2;
         let mut mixed = vec![0.0_f32; total_samples];
 
         for track in tracks {
-            let ch = track.channels as usize;
-            let frames = track.samples.len() / ch;
-            for f in 0..frames {
-                let left;
-                let right;
-                if ch == 1 {
-                    left = track.samples[f];
-                    right = left;
-                } else {
-                    left = track.samples[f * ch];
-                    right = track.samples[f * ch + 1];
+            for clip in &track.clips {
+                let ch = clip.channels as usize;
+                let frames = clip.samples.len() / ch;
+                let offset_frames = (clip.offset_secs * sample_rate as f64) as usize;
+
+                for f in 0..frames {
+                    let out_f = offset_frames + f;
+                    if out_f >= max_frames as usize {
+                        break;
+                    }
+                    let left;
+                    let right;
+                    if ch == 1 {
+                        left = clip.samples[f];
+                        right = left;
+                    } else {
+                        left = clip.samples[f * ch];
+                        right = clip.samples[f * ch + 1];
+                    }
+                    mixed[out_f * 2] += left;
+                    mixed[out_f * 2 + 1] += right;
                 }
-                mixed[f * 2] += left;
-                mixed[f * 2 + 1] += right;
             }
         }
 

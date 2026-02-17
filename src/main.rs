@@ -35,9 +35,23 @@ fn push_quad(vertices: &mut Vec<Vertex>, x0: f32, y0: f32, x1: f32, y1: f32, col
 }
 
 struct PendingLoad {
-    result: Arc<Mutex<Option<Result<audio::AudioTrack, String>>>>,
+    result: Arc<Mutex<Option<Result<audio::Clip, String>>>>,
     progress: Arc<AtomicU8>,
+    /// Which track to add the clip to, or None to create a new track
+    target_track: Option<usize>,
+    /// Timeline position for the new clip
+    clip_offset_secs: f64,
 }
+
+struct DragState {
+    track_idx: usize,
+    clip_idx: usize,
+    start_offset: f64,
+    start_x: f64,
+    active: bool, // becomes true once cursor moves past threshold
+}
+
+const DRAG_THRESHOLD_PX: f64 = 4.0;
 
 struct App {
     window: Option<Arc<Window>>,
@@ -46,12 +60,13 @@ struct App {
     queue: Option<wgpu::Queue>,
     config: Option<wgpu::SurfaceConfiguration>,
     pipeline: Option<wgpu::RenderPipeline>,
-    tracks: Vec<audio::AudioTrack>,
+    tracks: Vec<audio::Track>,
     player: Option<playback::Player>,
     modifiers: ModifiersState,
     cursor_x: f64,
     cursor_y: f64,
     selected_track: Option<usize>,
+    selected_clip: Option<usize>,
     // Horizontal zoom/scroll state
     view_start: f64,    // left edge in seconds
     view_duration: f64, // visible time span in seconds
@@ -59,6 +74,7 @@ struct App {
     modal_input_width_px: f32,
     project_rate: u32,
     loading: Option<PendingLoad>,
+    dragging: Option<DragState>,
     // Text rendering (glyphon)
     font_system: Option<FontSystem>,
     swash_cache: Option<SwashCache>,
@@ -83,12 +99,14 @@ impl App {
             cursor_x: 0.0,
             cursor_y: 0.0,
             selected_track: None,
+            selected_clip: None,
             view_start: 0.0,
             view_duration: 0.0, // 0 means "show everything" until tracks are loaded
             modal: None,
             modal_input_width_px: 0.0,
             project_rate: 48_000,
             loading: None,
+            dragging: None,
             font_system: None,
             swash_cache: None,
             glyphon_cache: None,
@@ -236,6 +254,43 @@ impl App {
         if self.view_duration > 0.0 { self.view_duration } else { self.max_duration() }
     }
 
+    /// Get the current playhead position in seconds
+    fn playhead_secs(&self) -> f64 {
+        if let Some(player) = &self.player {
+            player.position_frac() * self.max_duration()
+        } else {
+            0.0
+        }
+    }
+
+    /// Hit-test: find which (track_idx, clip_idx) is at pixel position (px, py)
+    fn hit_test_clip(&self, px: f64, py: f64) -> Option<(usize, usize)> {
+        if self.tracks.is_empty() {
+            return None;
+        }
+        let config = self.config.as_ref()?;
+        let num_tracks = self.tracks.len();
+        let lane_height_px = config.height as f64 / num_tracks as f64;
+        let track_idx = (py / lane_height_px) as usize;
+        if track_idx >= num_tracks {
+            return None;
+        }
+
+        let view_start = self.view_start;
+        let view_duration = self.effective_view_duration();
+        let cursor_secs = view_start + (px / config.width as f64) * view_duration;
+
+        let track = &self.tracks[track_idx];
+        for (clip_idx, clip) in track.clips.iter().enumerate() {
+            let clip_start = clip.offset_secs;
+            let clip_end = clip.offset_secs + clip.duration_secs();
+            if cursor_secs >= clip_start && cursor_secs <= clip_end {
+                return Some((track_idx, clip_idx));
+            }
+        }
+        None
+    }
+
     fn build_waveform_vertices(&self, width: u32, height: u32) -> Vec<Vertex> {
         if self.tracks.is_empty() {
             return Vec::new();
@@ -248,6 +303,14 @@ impl App {
             [0.7, 0.5, 0.8],  // purple
             [0.8, 0.7, 0.3],  // yellow
             [0.3, 0.7, 0.7],  // cyan
+        ];
+        const SELECTED_CLIP_COLORS: [[f32; 3]; 6] = [
+            [0.4, 0.9, 0.5],
+            [0.4, 0.65, 1.0],
+            [1.0, 0.5, 0.4],
+            [0.9, 0.65, 1.0],
+            [1.0, 0.9, 0.4],
+            [0.4, 0.9, 0.9],
         ];
         const DIVIDER_COLOR: [f32; 3] = [0.25, 0.25, 0.28];
         const TITLE_BG_COLOR: [f32; 3] = [0.18, 0.18, 0.21];
@@ -265,61 +328,83 @@ impl App {
         let mut vertices = Vec::new();
 
         for (idx, track) in self.tracks.iter().enumerate() {
-            let color = TRACK_COLORS[idx % TRACK_COLORS.len()];
-            let center_color = [color[0] * 0.5, color[1] * 0.5, color[2] * 0.5];
+            let base_color = TRACK_COLORS[idx % TRACK_COLORS.len()];
+            let bright_color = SELECTED_CLIP_COLORS[idx % SELECTED_CLIP_COLORS.len()];
 
             let lane_top = 1.0 - idx as f32 * lane_height;
             let lane_bot = lane_top - lane_height;
 
-            // Title bar background (brighter when selected)
+            // Title bar / center line geometry
             let title_top = lane_top;
             let title_bot = (lane_top - title_h).max(lane_bot);
-            let title_color = if self.selected_track == Some(idx) {
-                [0.25, 0.25, 0.32]
-            } else {
-                TITLE_BG_COLOR
-            };
-            push_quad(&mut vertices, -1.0, title_bot, 1.0, title_top, title_color);
 
             // Center line for this track (in waveform area, below title bar)
-            let wave_top_here = title_bot;
-            let wave_center_here = (wave_top_here + lane_bot) / 2.0;
-            push_quad(&mut vertices, -1.0, wave_center_here - line_h, 1.0, wave_center_here + line_h, center_color);
+            let wave_top = title_bot;
+            let wave_bot = lane_bot;
+            let wave_center = (wave_top + wave_bot) / 2.0;
+            let half_wave = (wave_top - wave_bot) / 2.0;
+            let center_color = [base_color[0] * 0.5, base_color[1] * 0.5, base_color[2] * 0.5];
+            push_quad(&mut vertices, -1.0, wave_center - line_h, 1.0, wave_center + line_h, center_color);
 
             // Divider line between tracks
             if idx > 0 {
                 push_quad(&mut vertices, -1.0, lane_top - line_h, 1.0, lane_top + line_h, DIVIDER_COLOR);
             }
 
-            // Waveform — only draw samples visible in the current view window
-            // Use the area below the title bar for waveform drawing
-            let wave_top = title_bot;
-            let wave_bot = lane_bot;
-            let wave_center = (wave_top + wave_bot) / 2.0;
-            let half_wave = (wave_top - wave_bot) / 2.0;
+            // Draw each clip in this track
+            for (clip_idx, clip) in track.clips.iter().enumerate() {
+                let is_selected = self.selected_track == Some(idx) && self.selected_clip == Some(clip_idx);
+                let color = if is_selected { bright_color } else { base_color };
 
-            let mono_len = track.mono.len();
-            let sr = track.sample_rate as f64;
-            let track_duration = track.duration_secs();
+                let clip_start_sec = clip.offset_secs;
+                let clip_end_sec = clip.offset_secs + clip.duration_secs();
 
-            // Clamp visible range to this track's actual duration
-            let vis_start_sec = view_start.max(0.0);
-            let vis_end_sec = view_end.min(track_duration);
+                // Clamp to visible window
+                let vis_start_sec = clip_start_sec.max(view_start);
+                let vis_end_sec = clip_end_sec.min(view_end);
 
-            if vis_start_sec < vis_end_sec {
-                let vis_start_sample = (vis_start_sec * sr) as usize;
-                let vis_end_sample = ((vis_end_sec * sr) as usize).min(mono_len);
+                if vis_start_sec >= vis_end_sec {
+                    continue;
+                }
+
+                // Clip title bar background (spans only this clip's width)
+                let clip_x0_ndc = ((vis_start_sec - view_start) / view_duration) as f32 * 2.0 - 1.0;
+                let clip_x1_ndc = ((vis_end_sec - view_start) / view_duration) as f32 * 2.0 - 1.0;
+                let title_color = if is_selected {
+                    [0.25, 0.25, 0.32]
+                } else {
+                    TITLE_BG_COLOR
+                };
+                push_quad(&mut vertices, clip_x0_ndc, title_bot, clip_x1_ndc, title_top, title_color);
+
+                let mono_len = clip.mono.len();
+                let sr = clip.sample_rate as f64;
+
+                // The portion of the clip that's visible (relative to clip start)
+                let clip_vis_start = vis_start_sec - clip_start_sec;
+                let clip_vis_end = vis_end_sec - clip_start_sec;
+
+                let vis_start_sample = (clip_vis_start * sr) as usize;
+                let vis_end_sample = ((clip_vis_end * sr) as usize).min(mono_len);
+
+                if vis_start_sample >= vis_end_sample {
+                    continue;
+                }
+
                 let vis_sample_count = vis_end_sample - vis_start_sample;
 
-                // How many pixel columns does this track's visible portion span?
+                // How many pixel columns does this clip's visible portion span?
                 let vis_frac = (vis_end_sec - vis_start_sec) / view_duration;
-                let track_cols = (width as f64 * vis_frac) as u32;
-                let samples_per_col = (vis_sample_count as f64 / track_cols.max(1) as f64).max(1.0);
+                let clip_cols = (width as f64 * vis_frac) as u32;
+                if clip_cols == 0 {
+                    continue;
+                }
+                let samples_per_col = (vis_sample_count as f64 / clip_cols as f64).max(1.0);
 
                 // Where does the visible portion start in NDC x?
                 let x_offset = ((vis_start_sec - view_start) / view_duration) as f32;
 
-                for col in 0..track_cols {
+                for col in 0..clip_cols {
                     let start = vis_start_sample + (col as f64 * samples_per_col) as usize;
                     let end = (vis_start_sample + (((col + 1) as f64) * samples_per_col) as usize).min(vis_end_sample);
 
@@ -327,7 +412,7 @@ impl App {
                         continue;
                     }
 
-                    let (min_val, max_val) = track.min_max_range(start, end);
+                    let (min_val, max_val) = clip.min_max_range(start, end);
 
                     let x0 = (x_offset + col as f32 / width as f32) * 2.0 - 1.0;
                     let x1 = (x_offset + (col + 1) as f32 / width as f32) * 2.0 - 1.0;
@@ -420,7 +505,7 @@ impl App {
             .pick_file();
 
         if let Some(path) = file {
-            let result: Arc<Mutex<Option<Result<audio::AudioTrack, String>>>> =
+            let result: Arc<Mutex<Option<Result<audio::Clip, String>>>> =
                 Arc::new(Mutex::new(None));
             let progress = Arc::new(AtomicU8::new(0));
 
@@ -437,7 +522,9 @@ impl App {
                 *result_clone.lock().unwrap() = Some(res);
             });
 
-            self.loading = Some(PendingLoad { result, progress });
+            let clip_offset_secs = self.playhead_secs();
+
+            self.loading = Some(PendingLoad { result, progress, target_track: None, clip_offset_secs });
             self.window.as_ref().unwrap().set_title("Loading…");
         }
     }
@@ -466,8 +553,25 @@ impl App {
         if done {
             let pending = self.loading.take().unwrap();
             let res = pending.result.lock().unwrap().take().unwrap();
-            if let Ok(track) = res {
-                self.tracks.push(track);
+            if let Ok(mut clip) = res {
+                clip.offset_secs = pending.clip_offset_secs;
+
+                if let Some(track_idx) = pending.target_track {
+                    // Add clip to existing track
+                    if track_idx < self.tracks.len() {
+                        self.selected_clip = Some(self.tracks[track_idx].clips.len());
+                        self.tracks[track_idx].clips.push(clip);
+                        self.selected_track = Some(track_idx);
+                    }
+                } else {
+                    // Create a new track with this clip
+                    self.tracks.push(audio::Track {
+                        clips: vec![clip],
+                    });
+                    self.selected_track = Some(self.tracks.len() - 1);
+                    self.selected_clip = Some(0);
+                }
+
                 self.view_duration = self.max_duration();
                 self.view_start = 0.0;
                 self.rebuild_player();
@@ -491,8 +595,10 @@ impl App {
         match result {
             modal::ModalResult::ClickTrackBpm(bpm) => {
                 let dur = if self.max_duration() > 0.0 { self.max_duration() } else { 30.0 };
-                let track = audio::generate_click_track(bpm, dur, self.project_rate);
-                self.tracks.push(track);
+                let clip = audio::generate_click_track(bpm, dur, self.project_rate);
+                self.tracks.push(audio::Track {
+                    clips: vec![clip],
+                });
                 self.view_duration = self.max_duration();
                 self.view_start = 0.0;
                 self.rebuild_player();
@@ -517,19 +623,38 @@ impl App {
         let padding_phys = 8.0 * scale;
 
         let mut text_buffers: Vec<Buffer> = Vec::new();
-        let mut track_text_count = 0;
+        // (track_idx, clip_left_px, clip_width_px) for each clip text buffer
+        let mut clip_text_positions: Vec<(usize, f32, f32)> = Vec::new();
+
+        let view_start = self.view_start;
+        let view_duration = self.effective_view_duration();
+        let view_end = view_start + view_duration;
+
         let font_system = self.font_system.as_mut().unwrap();
 
-        // Track title text buffers
+        // Per-clip title text buffers
         if !self.tracks.is_empty() {
-            for track in &self.tracks {
-                let mut buffer = Buffer::new(font_system, Metrics::new(font_size_phys, line_height_phys));
-                buffer.set_size(font_system, Some(width as f32 - padding_phys * 2.0), Some(title_bar_phys));
-                buffer.set_text(font_system, &track.name, &Attrs::new().family(Family::SansSerif), Shaping::Advanced, None);
-                buffer.shape_until_scroll(font_system, false);
-                text_buffers.push(buffer);
+            for (track_idx, track) in self.tracks.iter().enumerate() {
+                for clip in &track.clips {
+                    let clip_start = clip.offset_secs;
+                    let clip_end = clip.offset_secs + clip.duration_secs();
+                    let vis_start = clip_start.max(view_start);
+                    let vis_end = clip_end.min(view_end);
+                    if vis_start >= vis_end {
+                        continue;
+                    }
+                    let clip_left_px = ((vis_start - view_start) / view_duration) as f32 * width as f32;
+                    let clip_right_px = ((vis_end - view_start) / view_duration) as f32 * width as f32;
+                    let clip_width_px = clip_right_px - clip_left_px;
+
+                    let mut buffer = Buffer::new(font_system, Metrics::new(font_size_phys, line_height_phys));
+                    buffer.set_size(font_system, Some((clip_width_px - padding_phys * 2.0).max(0.0)), Some(title_bar_phys));
+                    buffer.set_text(font_system, &clip.name, &Attrs::new().family(Family::SansSerif), Shaping::Advanced, None);
+                    buffer.shape_until_scroll(font_system, false);
+                    text_buffers.push(buffer);
+                    clip_text_positions.push((track_idx, clip_left_px, clip_width_px));
+                }
             }
-            track_text_count = self.tracks.len();
         }
 
         // Modal text buffers (title + input)
@@ -577,19 +702,19 @@ impl App {
 
             let mut text_areas: Vec<TextArea> = Vec::new();
 
-            // Track titles
-            for idx in 0..track_text_count {
-                let lane_top = idx as f32 * lane_height_px;
+            // Clip titles
+            for (buf_idx, &(track_idx, clip_left_px, clip_width_px)) in clip_text_positions.iter().enumerate() {
+                let lane_top = track_idx as f32 * lane_height_px;
                 let vert_pad = (title_bar_phys - line_height_phys) / 2.0;
                 text_areas.push(TextArea {
-                    buffer: &text_buffers[idx],
-                    left: padding_phys,
+                    buffer: &text_buffers[buf_idx],
+                    left: clip_left_px + padding_phys,
                     top: lane_top + vert_pad,
                     scale: 1.0,
                     bounds: TextBounds {
-                        left: 0,
+                        left: clip_left_px as i32,
                         top: lane_top as i32,
-                        right: width as i32,
+                        right: (clip_left_px + clip_width_px) as i32,
                         bottom: (lane_top + title_bar_phys) as i32,
                     },
                     default_color: GlyphonColor::rgb(220, 220, 220),
@@ -823,8 +948,10 @@ impl ApplicationHandler for App {
                     // Fix selection
                     if self.tracks.is_empty() {
                         self.selected_track = None;
+                        self.selected_clip = None;
                     } else {
                         self.selected_track = Some(idx.min(self.tracks.len() - 1));
+                        self.selected_clip = None;
                     }
                     // Reset view to fit remaining tracks
                     self.view_start = 0.0;
@@ -865,20 +992,60 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_x = position.x;
                 self.cursor_y = position.y;
+
+                // Handle clip dragging
+                if let Some(drag) = &mut self.dragging {
+                    let dx_px = position.x - drag.start_x;
+                    if !drag.active && dx_px.abs() >= DRAG_THRESHOLD_PX {
+                        drag.active = true;
+                    }
+                }
+                if let Some(drag) = &self.dragging {
+                    if drag.active {
+                        let config = self.config.as_ref().unwrap();
+                        let view_duration = self.effective_view_duration();
+                        let dx_px = position.x - drag.start_x;
+                        let dx_secs = dx_px / config.width as f64 * view_duration;
+                        let new_offset = (drag.start_offset + dx_secs).max(0.0);
+
+                        let track_idx = drag.track_idx;
+                        let clip_idx = drag.clip_idx;
+                        if track_idx < self.tracks.len() && clip_idx < self.tracks[track_idx].clips.len() {
+                            self.tracks[track_idx].clips[clip_idx].offset_secs = new_offset;
+                            self.window.as_ref().unwrap().request_redraw();
+                        }
+                    }
+                }
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button: winit::event::MouseButton::Left,
                 ..
             } => {
-                // Select track based on click y position
-                if !self.tracks.is_empty() {
+                // Hit-test for clip selection and potential drag
+                if let Some((track_idx, clip_idx)) = self.hit_test_clip(self.cursor_x, self.cursor_y) {
+                    self.selected_track = Some(track_idx);
+                    self.selected_clip = Some(clip_idx);
+
+                    // Prepare drag (not active until cursor moves past threshold)
+                    let clip = &self.tracks[track_idx].clips[clip_idx];
+                    self.dragging = Some(DragState {
+                        track_idx,
+                        clip_idx,
+                        start_offset: clip.offset_secs,
+                        start_x: self.cursor_x,
+                        active: false,
+                    });
+                } else if !self.tracks.is_empty() {
+                    // Click on empty area — select track but deselect clip
                     if let Some(config) = &self.config {
                         let track_idx = (self.cursor_y / config.height as f64 * self.tracks.len() as f64) as usize;
                         self.selected_track = Some(track_idx.min(self.tracks.len() - 1));
+                        self.selected_clip = None;
                     }
                 }
-                // Seek
+
+                // Always seek on click
                 if let (Some(player), Some(config)) = (&self.player, &self.config) {
                     let cursor_frac = self.cursor_x / config.width as f64;
                     let view_dur = self.effective_view_duration();
@@ -889,6 +1056,18 @@ impl ApplicationHandler for App {
                     }
                 }
                 self.window.as_ref().unwrap().request_redraw();
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: winit::event::MouseButton::Left,
+                ..
+            } => {
+                if let Some(drag) = self.dragging.take() {
+                    if drag.active {
+                        self.rebuild_player();
+                    }
+                    self.window.as_ref().unwrap().request_redraw();
+                }
             }
             // Horizontal scroll: two-finger trackpad swipe / shift+wheel
             WindowEvent::MouseWheel { delta, .. } if !self.modifiers.super_key() => {
