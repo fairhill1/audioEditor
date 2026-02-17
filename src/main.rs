@@ -1123,6 +1123,29 @@ impl ApplicationHandler for App {
             }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed
+                    && event.physical_key == PhysicalKey::Code(KeyCode::KeyS)
+                    && !self.modifiers.super_key() =>
+            {
+                // Split selected clip at the playhead
+                if let (Some(track_idx), Some(clip_idx)) = (self.selected_track, self.selected_clip) {
+                    let playhead = self.playhead_secs();
+                    let clip = &self.tracks[track_idx].clips[clip_idx];
+                    let clip_start = clip.offset_secs;
+                    let clip_end = clip_start + clip.duration_secs();
+                    // Only split if playhead is strictly inside the clip
+                    if playhead > clip_start && playhead < clip_end {
+                        let split_at = playhead - clip_start;
+                        let right = self.tracks[track_idx].clips[clip_idx].split_at(split_at);
+                        self.tracks[track_idx].clips.insert(clip_idx + 1, right);
+                        // Select the right half
+                        self.selected_clip = Some(clip_idx + 1);
+                        self.rebuild_player();
+                        self.window.as_ref().unwrap().request_redraw();
+                    }
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
                     && event.physical_key == PhysicalKey::Code(KeyCode::Backspace)
                     && !self.tracks.is_empty() =>
             {

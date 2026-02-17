@@ -59,6 +59,29 @@ impl Clip {
             .collect()
     }
 
+    /// Split this clip at `secs` (relative to clip start), returning the right half.
+    /// This clip is truncated to the left half.
+    pub fn split_at(&mut self, secs: f64) -> Clip {
+        let mono_idx = (secs * self.sample_rate as f64) as usize;
+        let sample_idx = mono_idx * self.channels as usize;
+
+        let right_samples = self.samples.split_off(sample_idx.min(self.samples.len()));
+        let right_mono = self.mono.split_off(mono_idx.min(self.mono.len()));
+        // Rebuild summaries for both halves
+        self.summary = Self::build_summary(&self.mono);
+        let right_summary = Self::build_summary(&right_mono);
+
+        Clip {
+            name: self.name.clone(),
+            samples: right_samples,
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+            mono: right_mono,
+            summary: right_summary,
+            offset_secs: self.offset_secs + secs,
+        }
+    }
+
     /// Get min/max for a range of mono samples, using the summary where possible
     pub fn min_max_range(&self, start: usize, end: usize) -> (f32, f32) {
         let mut min_val = 0.0_f32;
