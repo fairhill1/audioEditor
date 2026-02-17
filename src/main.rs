@@ -696,22 +696,13 @@ impl App {
                 let cur_sel_clip = self.selected_clip;
                 // The split produced clips at clip_idx and clip_idx+1
                 // Save current two halves so redo can re-split
-                let left = self.tracks[track_idx].clips.remove(clip_idx);
-                let right = self.tracks[track_idx].clips.remove(clip_idx); // was clip_idx+1, now clip_idx
+                self.tracks[track_idx].clips.remove(clip_idx);
+                self.tracks[track_idx].clips.remove(clip_idx); // was clip_idx+1, now clip_idx
                 self.tracks[track_idx].clips.insert(clip_idx, original_clip.clone());
                 self.selected_clip = prev_sel_clip;
                 // Reverse: split again (store the original we just restored)
                 // On redo, we re-split the original clip the same way
-                let split_secs = left.duration_secs();
-                let mut redo_original = original_clip;
-                let redo_right = redo_original.split_at(split_secs);
-                // But wait — we already modified redo_original in place. We need the full original for redo.
-                // Actually, let's just re-merge left+right back into the original for the reverse.
-                // Simpler: store the original clip (pre-split) so redo can split it again.
-                // We already have the merged original in tracks. Clone it for the redo action.
                 let merged = self.tracks[track_idx].clips[clip_idx].clone();
-                // Undo the split_at we accidentally did on redo_original — just use merged
-                // For redo, we provide SplitClip with the merged clip as original
                 undo::UndoAction::SplitClip {
                     track_idx, clip_idx,
                     original_clip: merged,
