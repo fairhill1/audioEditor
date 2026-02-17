@@ -1712,7 +1712,8 @@ impl ApplicationHandler for App {
                 if let Some(player) = &self.player {
                     let max_dur = self.max_duration();
                     if max_dur > 0.0 {
-                        let step = if self.modifiers.shift_key() { 0.1 } else { 1.0 };
+                        let view = self.effective_view_duration();
+                        let step = if self.modifiers.shift_key() { view * 0.01 } else { view * 0.05 };
                         let dir = if event.physical_key == PhysicalKey::Code(KeyCode::ArrowLeft) { -1.0 } else { 1.0 };
                         let cur_secs = player.position_frac() * max_dur;
                         let new_secs = (cur_secs + dir * step).clamp(0.0, max_dur);
