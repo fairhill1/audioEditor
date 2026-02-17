@@ -32,6 +32,8 @@ struct App {
     player: Option<playback::Player>,
     modifiers: ModifiersState,
     cursor_x: f64,
+    cursor_y: f64,
+    selected_track: Option<usize>,
     // Horizontal zoom/scroll state
     view_start: f64,    // left edge in seconds
     view_duration: f64, // visible time span in seconds
@@ -57,6 +59,8 @@ impl App {
             player: None,
             modifiers: ModifiersState::empty(),
             cursor_x: 0.0,
+            cursor_y: 0.0,
+            selected_track: None,
             view_start: 0.0,
             view_duration: 0.0, // 0 means "show everything" until tracks are loaded
             font_system: None,
@@ -238,16 +242,21 @@ impl App {
             let lane_bot = lane_top - lane_height;
             let lane_center = (lane_top + lane_bot) / 2.0;
 
-            // Title bar background
+            // Title bar background (brighter when selected)
             let title_top = lane_top;
             let title_bot = (lane_top - title_h).max(lane_bot);
+            let title_color = if self.selected_track == Some(idx) {
+                [0.25, 0.25, 0.32]
+            } else {
+                TITLE_BG_COLOR
+            };
             vertices.extend_from_slice(&[
-                Vertex { position: [-1.0, title_top], color: TITLE_BG_COLOR },
-                Vertex { position: [1.0, title_top], color: TITLE_BG_COLOR },
-                Vertex { position: [-1.0, title_bot], color: TITLE_BG_COLOR },
-                Vertex { position: [-1.0, title_bot], color: TITLE_BG_COLOR },
-                Vertex { position: [1.0, title_top], color: TITLE_BG_COLOR },
-                Vertex { position: [1.0, title_bot], color: TITLE_BG_COLOR },
+                Vertex { position: [-1.0, title_top], color: title_color },
+                Vertex { position: [1.0, title_top], color: title_color },
+                Vertex { position: [-1.0, title_bot], color: title_color },
+                Vertex { position: [-1.0, title_bot], color: title_color },
+                Vertex { position: [1.0, title_top], color: title_color },
+                Vertex { position: [1.0, title_bot], color: title_color },
             ]);
 
             // Center line for this track
@@ -575,6 +584,27 @@ impl ApplicationHandler for App {
             }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed
+                    && event.physical_key == PhysicalKey::Code(KeyCode::Backspace)
+                    && !self.tracks.is_empty() =>
+            {
+                if let Some(idx) = self.selected_track {
+                    self.tracks.remove(idx);
+                    // Fix selection
+                    if self.tracks.is_empty() {
+                        self.selected_track = None;
+                    } else {
+                        self.selected_track = Some(idx.min(self.tracks.len() - 1));
+                    }
+                    // Reset view to fit remaining tracks
+                    self.view_start = 0.0;
+                    self.view_duration = self.max_duration();
+                    self.rebuild_player();
+                    self.update_title();
+                    self.window.as_ref().unwrap().request_redraw();
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
                     && event.physical_key == PhysicalKey::Code(KeyCode::Space) =>
             {
                 if let Some(player) = &self.player {
@@ -584,12 +614,21 @@ impl ApplicationHandler for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_x = position.x;
+                self.cursor_y = position.y;
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button: winit::event::MouseButton::Left,
                 ..
             } => {
+                // Select track based on click y position
+                if !self.tracks.is_empty() {
+                    if let Some(config) = &self.config {
+                        let track_idx = (self.cursor_y / config.height as f64 * self.tracks.len() as f64) as usize;
+                        self.selected_track = Some(track_idx.min(self.tracks.len() - 1));
+                    }
+                }
+                // Seek
                 if let (Some(player), Some(config)) = (&self.player, &self.config) {
                     let cursor_frac = self.cursor_x / config.width as f64;
                     let view_dur = if self.view_duration > 0.0 { self.view_duration } else { self.max_duration() };
@@ -598,8 +637,8 @@ impl ApplicationHandler for App {
                     if max_dur > 0.0 {
                         player.seek_frac(click_secs / max_dur);
                     }
-                    self.window.as_ref().unwrap().request_redraw();
                 }
+                self.window.as_ref().unwrap().request_redraw();
             }
             // Horizontal scroll: two-finger trackpad swipe / shift+wheel
             WindowEvent::MouseWheel { delta, .. } if !self.modifiers.super_key() => {
