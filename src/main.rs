@@ -80,6 +80,7 @@ struct App {
     project_rate: u32,
     loading: Option<PendingLoad>,
     dragging: Option<DragState>,
+    clipboard: Option<audio::Clip>,
     // Text rendering (glyphon)
     font_system: Option<FontSystem>,
     swash_cache: Option<SwashCache>,
@@ -113,6 +114,7 @@ impl App {
             project_rate: 48_000,
             loading: None,
             dragging: None,
+            clipboard: None,
             font_system: None,
             swash_cache: None,
             glyphon_cache: None,
@@ -1193,6 +1195,69 @@ impl ApplicationHandler for App {
                     && self.modifiers.shift_key() =>
             {
                 self.save_project_as();
+            }
+            // Cmd+C: Copy selected clip
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && event.physical_key == PhysicalKey::Code(KeyCode::KeyC)
+                    && self.modifiers.super_key() =>
+            {
+                if let (Some(track_idx), Some(clip_idx)) = (self.selected_track, self.selected_clip) {
+                    if track_idx < self.tracks.len() && clip_idx < self.tracks[track_idx].clips.len() {
+                        self.clipboard = Some(self.tracks[track_idx].clips[clip_idx].clone());
+                    }
+                }
+            }
+            // Cmd+X: Cut selected clip
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && event.physical_key == PhysicalKey::Code(KeyCode::KeyX)
+                    && self.modifiers.super_key() =>
+            {
+                if let (Some(track_idx), Some(clip_idx)) = (self.selected_track, self.selected_clip) {
+                    if track_idx < self.tracks.len() && clip_idx < self.tracks[track_idx].clips.len() {
+                        let clip = self.tracks[track_idx].clips.remove(clip_idx);
+                        self.clipboard = Some(clip);
+                        if self.tracks[track_idx].clips.is_empty() {
+                            self.selected_clip = None;
+                        } else {
+                            self.selected_clip = Some(clip_idx.min(self.tracks[track_idx].clips.len() - 1));
+                        }
+                        self.rebuild_player();
+                        self.window.as_ref().unwrap().request_redraw();
+                    }
+                }
+            }
+            // Cmd+V: Paste clip at playhead on selected track
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && event.physical_key == PhysicalKey::Code(KeyCode::KeyV)
+                    && self.modifiers.super_key() =>
+            {
+                if let (Some(clip), Some(track_idx)) = (&self.clipboard, self.selected_track) {
+                    if track_idx < self.tracks.len() {
+                        let mut new_clip = clip.clone();
+                        new_clip.offset_secs = self.playhead_secs();
+                        let clip_dur = new_clip.duration_secs();
+
+                        // Check for overlap with existing clips
+                        let overlaps = self.tracks[track_idx].clips.iter().any(|c| {
+                            let c_start = c.offset_secs;
+                            let c_end = c_start + c.duration_secs();
+                            let n_start = new_clip.offset_secs;
+                            let n_end = n_start + clip_dur;
+                            n_start < c_end && n_end > c_start
+                        });
+
+                        if !overlaps {
+                            let new_idx = self.tracks[track_idx].clips.len();
+                            self.tracks[track_idx].clips.push(new_clip);
+                            self.selected_clip = Some(new_idx);
+                            self.rebuild_player();
+                            self.window.as_ref().unwrap().request_redraw();
+                        }
+                    }
+                }
             }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed

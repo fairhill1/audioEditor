@@ -11,6 +11,7 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
+#[derive(Clone)]
 pub struct Clip {
     pub name: String,
     pub samples: Vec<f32>,

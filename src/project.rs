@@ -31,13 +31,21 @@ pub struct ClipEntry {
     pub channels: u32,
 }
 
+fn audio_dir_name(ron_path: &Path) -> String {
+    let stem = ron_path.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("project");
+    format!("{stem}_audio")
+}
+
 pub fn save_project(
     ron_path: &Path,
     tracks: &[audio::Track],
     project_rate: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let dir = ron_path.parent().unwrap_or(ron_path);
-    fs::create_dir_all(dir.join("audio"))?;
+    let audio_dir = audio_dir_name(ron_path);
+    fs::create_dir_all(dir.join(&audio_dir))?;
 
     // Deduplicate clips by content hash — identical samples share one WAV file
     let mut written: HashMap<u64, String> = HashMap::new();
@@ -54,7 +62,7 @@ pub fn save_project(
             } else {
                 let filename = format!("{}.wav", wav_counter);
                 wav_counter += 1;
-                let rel_path = format!("audio/{}", filename);
+                let rel_path = format!("{audio_dir}/{filename}");
                 write_wav(&dir.join(&rel_path), &clip.samples, clip.sample_rate, clip.channels)?;
                 written.insert(hash, rel_path.clone());
                 rel_path
