@@ -259,14 +259,16 @@ impl App {
                 Vertex { position: [1.0, title_bot], color: title_color },
             ]);
 
-            // Center line for this track
+            // Center line for this track (in waveform area, below title bar)
+            let wave_top_here = title_bot;
+            let wave_center_here = (wave_top_here + lane_bot) / 2.0;
             vertices.extend_from_slice(&[
-                Vertex { position: [-1.0, lane_center + line_h], color: center_color },
-                Vertex { position: [1.0, lane_center + line_h], color: center_color },
-                Vertex { position: [-1.0, lane_center - line_h], color: center_color },
-                Vertex { position: [-1.0, lane_center - line_h], color: center_color },
-                Vertex { position: [1.0, lane_center + line_h], color: center_color },
-                Vertex { position: [1.0, lane_center - line_h], color: center_color },
+                Vertex { position: [-1.0, wave_center_here + line_h], color: center_color },
+                Vertex { position: [1.0, wave_center_here + line_h], color: center_color },
+                Vertex { position: [-1.0, wave_center_here - line_h], color: center_color },
+                Vertex { position: [-1.0, wave_center_here - line_h], color: center_color },
+                Vertex { position: [1.0, wave_center_here + line_h], color: center_color },
+                Vertex { position: [1.0, wave_center_here - line_h], color: center_color },
             ]);
 
             // Divider line between tracks
@@ -282,10 +284,15 @@ impl App {
             }
 
             // Waveform — only draw samples visible in the current view window
+            // Use the area below the title bar for waveform drawing
+            let wave_top = title_bot;
+            let wave_bot = lane_bot;
+            let wave_center = (wave_top + wave_bot) / 2.0;
+            let half_wave = (wave_top - wave_bot) / 2.0;
+
             let mono_len = track.mono.len();
             let sr = track.sample_rate as f64;
             let track_duration = track.duration_secs();
-            let half_lane = lane_height / 2.0;
 
             // Clamp visible range to this track's actual duration
             let vis_start_sec = view_start.max(0.0);
@@ -317,8 +324,8 @@ impl App {
                     let x0 = (x_offset + col as f32 / width as f32) * 2.0 - 1.0;
                     let x1 = (x_offset + (col + 1) as f32 / width as f32) * 2.0 - 1.0;
 
-                    let y_top = lane_center + max_val * half_lane;
-                    let y_bot = lane_center + min_val * half_lane;
+                    let y_top = wave_center + max_val * half_wave;
+                    let y_bot = wave_center + min_val * half_wave;
 
                     vertices.extend_from_slice(&[
                         Vertex { position: [x0, y_top], color },
