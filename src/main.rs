@@ -44,10 +44,11 @@ struct PendingLoad {
 }
 
 struct DragState {
-    track_idx: usize,
     clip_idx: usize,
     start_offset: f64,
     start_x: f64,
+    start_y: f64,
+    current_track_idx: usize,
     active: bool, // becomes true once cursor moves past threshold
 }
 
@@ -289,6 +290,126 @@ impl App {
             }
         }
         None
+    }
+
+    /// Snap a clip's offset to nearby clip edges in the same track.
+    /// Returns the snapped offset, or the original if no snap applies.
+    fn snap_offset(&self, track_idx: usize, skip_clip: usize, desired: f64, clip_dur: f64) -> f64 {
+        let config = match self.config.as_ref() {
+            Some(c) => c,
+            None => return desired,
+        };
+        let view_duration = self.effective_view_duration();
+        let snap_secs = 10.0 / config.width as f64 * view_duration;
+
+        let clip_start = desired;
+        let clip_end = desired + clip_dur;
+
+        let mut best_offset = desired;
+        let mut best_dist = f64::MAX;
+
+        let track = &self.tracks[track_idx];
+        for (i, other) in track.clips.iter().enumerate() {
+            if i == skip_clip {
+                continue;
+            }
+            let other_start = other.offset_secs;
+            let other_end = other.offset_secs + other.duration_secs();
+
+            // Dragged clip start snaps to other clip end
+            let d = (clip_start - other_end).abs();
+            if d < snap_secs && d < best_dist {
+                best_dist = d;
+                best_offset = other_end;
+            }
+
+            // Dragged clip end snaps to other clip start
+            let d = (clip_end - other_start).abs();
+            if d < snap_secs && d < best_dist {
+                best_dist = d;
+                best_offset = other_start - clip_dur;
+            }
+
+            // Dragged clip start snaps to other clip start
+            let d = (clip_start - other_start).abs();
+            if d < snap_secs && d < best_dist {
+                best_dist = d;
+                best_offset = other_start;
+            }
+
+            // Dragged clip end snaps to other clip end
+            let d = (clip_end - other_end).abs();
+            if d < snap_secs && d < best_dist {
+                best_dist = d;
+                best_offset = other_end - clip_dur;
+            }
+        }
+
+        best_offset
+    }
+
+    /// Clamp a clip's offset so it doesn't overlap any other clip in the track.
+    /// Returns the nearest valid offset.
+    fn clamp_no_overlap(&self, track_idx: usize, skip_clip: usize, desired: f64, clip_dur: f64) -> f64 {
+        let track = &self.tracks[track_idx];
+
+        // Collect all other clips' intervals, sorted by start time
+        let mut intervals: Vec<(f64, f64)> = track
+            .clips
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != skip_clip)
+            .map(|(_, c)| (c.offset_secs, c.offset_secs + c.duration_secs()))
+            .collect();
+        intervals.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+        if intervals.is_empty() {
+            return desired.max(0.0);
+        }
+
+        // Build list of gaps where the clip could fit
+        // Gap before first clip
+        let mut candidates: Vec<f64> = Vec::new();
+
+        // Before first interval
+        if clip_dur <= intervals[0].0 {
+            // Clip fits before the first clip
+            let clamped = desired.clamp(0.0, intervals[0].0 - clip_dur);
+            candidates.push(clamped);
+        } else if 0.0 + clip_dur <= intervals[0].0 + 1e-9 {
+            candidates.push(0.0);
+        }
+
+        // Gaps between intervals
+        for i in 0..intervals.len() - 1 {
+            let gap_start = intervals[i].1;
+            let gap_end = intervals[i + 1].0;
+            let gap_size = gap_end - gap_start;
+            if gap_size >= clip_dur - 1e-9 {
+                let clamped = desired.clamp(gap_start, gap_end - clip_dur);
+                candidates.push(clamped);
+            }
+        }
+
+        // After last interval
+        let last_end = intervals.last().unwrap().1;
+        let clamped = desired.max(last_end);
+        candidates.push(clamped);
+
+        // Also consider placing at time 0 if there's room
+        if intervals[0].0 >= clip_dur && !candidates.iter().any(|&c| c < 1e-9) {
+            candidates.push(0.0);
+        }
+
+        // Pick the candidate nearest to desired
+        candidates
+            .into_iter()
+            .min_by(|a, b| {
+                let da = (*a - desired).abs();
+                let db = (*b - desired).abs();
+                da.partial_cmp(&db).unwrap()
+            })
+            .unwrap_or(desired.max(0.0))
     }
 
     fn build_waveform_vertices(&self, width: u32, height: u32) -> Vec<Vertex> {
@@ -995,25 +1116,62 @@ impl ApplicationHandler for App {
 
                 // Handle clip dragging
                 if let Some(drag) = &mut self.dragging {
-                    let dx_px = position.x - drag.start_x;
-                    if !drag.active && dx_px.abs() >= DRAG_THRESHOLD_PX {
-                        drag.active = true;
+                    if !drag.active {
+                        let dx = position.x - drag.start_x;
+                        let dy = position.y - drag.start_y;
+                        let dist = (dx * dx + dy * dy).sqrt();
+                        if dist >= DRAG_THRESHOLD_PX {
+                            drag.active = true;
+                        }
                     }
                 }
-                if let Some(drag) = &self.dragging {
-                    if drag.active {
-                        let config = self.config.as_ref().unwrap();
-                        let view_duration = self.effective_view_duration();
-                        let dx_px = position.x - drag.start_x;
-                        let dx_secs = dx_px / config.width as f64 * view_duration;
-                        let new_offset = (drag.start_offset + dx_secs).max(0.0);
+                if self.dragging.as_ref().is_some_and(|d| d.active) {
+                    let config = self.config.as_ref().unwrap();
+                    let view_duration = self.effective_view_duration();
+                    let num_tracks = self.tracks.len();
 
-                        let track_idx = drag.track_idx;
-                        let clip_idx = drag.clip_idx;
-                        if track_idx < self.tracks.len() && clip_idx < self.tracks[track_idx].clips.len() {
-                            self.tracks[track_idx].clips[clip_idx].offset_secs = new_offset;
-                            self.window.as_ref().unwrap().request_redraw();
-                        }
+                    let dx_px = position.x - self.dragging.as_ref().unwrap().start_x;
+                    let dx_secs = dx_px / config.width as f64 * view_duration;
+                    let desired_offset = (self.dragging.as_ref().unwrap().start_offset + dx_secs).max(0.0);
+
+                    // Determine target track from cursor Y
+                    let lane_height = config.height as f64 / num_tracks as f64;
+                    let target_track = ((position.y / lane_height) as usize).min(num_tracks - 1);
+
+                    let current_track = self.dragging.as_ref().unwrap().current_track_idx;
+                    let clip_idx = self.dragging.as_ref().unwrap().clip_idx;
+
+                    // Move clip between tracks if needed
+                    let clip_idx = if target_track != current_track
+                        && current_track < self.tracks.len()
+                        && clip_idx < self.tracks[current_track].clips.len()
+                    {
+                        let clip = self.tracks[current_track].clips.remove(clip_idx);
+                        self.tracks[target_track].clips.push(clip);
+                        let new_idx = self.tracks[target_track].clips.len() - 1;
+                        let drag = self.dragging.as_mut().unwrap();
+                        drag.current_track_idx = target_track;
+                        drag.clip_idx = new_idx;
+                        self.selected_track = Some(target_track);
+                        self.selected_clip = Some(new_idx);
+                        new_idx
+                    } else {
+                        clip_idx
+                    };
+
+                    let track_idx = self.dragging.as_ref().unwrap().current_track_idx;
+
+                    if track_idx < self.tracks.len() && clip_idx < self.tracks[track_idx].clips.len() {
+                        let clip_dur = self.tracks[track_idx].clips[clip_idx].duration_secs();
+
+                        // Snap to nearby clip edges
+                        let snapped = self.snap_offset(track_idx, clip_idx, desired_offset, clip_dur);
+
+                        // Prevent overlap
+                        let final_offset = self.clamp_no_overlap(track_idx, clip_idx, snapped, clip_dur);
+
+                        self.tracks[track_idx].clips[clip_idx].offset_secs = final_offset;
+                        self.window.as_ref().unwrap().request_redraw();
                     }
                 }
             }
@@ -1030,10 +1188,11 @@ impl ApplicationHandler for App {
                     // Prepare drag (not active until cursor moves past threshold)
                     let clip = &self.tracks[track_idx].clips[clip_idx];
                     self.dragging = Some(DragState {
-                        track_idx,
                         clip_idx,
                         start_offset: clip.offset_secs,
                         start_x: self.cursor_x,
+                        start_y: self.cursor_y,
+                        current_track_idx: track_idx,
                         active: false,
                     });
                 } else if !self.tracks.is_empty() {
@@ -1064,6 +1223,8 @@ impl ApplicationHandler for App {
             } => {
                 if let Some(drag) = self.dragging.take() {
                     if drag.active {
+                        self.selected_track = Some(drag.current_track_idx);
+                        self.selected_clip = Some(drag.clip_idx);
                         self.rebuild_player();
                     }
                     self.window.as_ref().unwrap().request_redraw();
