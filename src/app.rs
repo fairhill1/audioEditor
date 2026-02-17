@@ -69,6 +69,7 @@ pub(crate) enum DeferredAction {
     OpenProject,
     SaveProject,
     SaveProjectAs,
+    ExportWav,
 }
 
 /// A native file dialog running on a background thread.

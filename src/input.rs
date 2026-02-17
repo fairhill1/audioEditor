@@ -66,6 +66,21 @@ impl ApplicationHandler for App {
                                 *result_clone.lock().unwrap() = Some(file);
                             });
                         }
+                        DeferredAction::ExportWav => {
+                            let default_name = self.project_path.as_ref()
+                                .and_then(|p| p.file_stem())
+                                .and_then(|n| n.to_str())
+                                .map(|n| format!("{n}.wav"))
+                                .unwrap_or_else(|| "export.wav".to_string());
+                            std::thread::spawn(move || {
+                                let file = rfd::FileDialog::new()
+                                    .set_title("Export WAV")
+                                    .set_file_name(&default_name)
+                                    .add_filter("WAV Audio", &["wav"])
+                                    .save_file();
+                                *result_clone.lock().unwrap() = Some(file);
+                            });
+                        }
                     }
                     self.pending_dialog = Some(PendingDialog { result, action });
                 }
@@ -84,6 +99,9 @@ impl ApplicationHandler for App {
                         DeferredAction::OpenProject => self.open_project_from_path(path),
                         DeferredAction::SaveProject | DeferredAction::SaveProjectAs => {
                             self.save_project_to_path(path);
+                        }
+                        DeferredAction::ExportWav => {
+                            self.export_wav_to_path(path);
                         }
                     }
                 }
@@ -211,6 +229,16 @@ impl ApplicationHandler for App {
                     && self.modifiers.shift_key() =>
             {
                 self.deferred_action = Some(DeferredAction::SaveProjectAs);
+            }
+            // Cmd+E: Export/render to WAV
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && event.physical_key == PhysicalKey::Code(KeyCode::KeyE)
+                    && self.modifiers.super_key() =>
+            {
+                if !self.tracks.is_empty() {
+                    self.deferred_action = Some(DeferredAction::ExportWav);
+                }
             }
             // Cmd+Shift+Z: Redo
             WindowEvent::KeyboardInput { event, .. }

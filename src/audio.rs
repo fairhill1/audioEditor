@@ -314,21 +314,20 @@ pub fn load_file(path: &Path, project_rate: u32, on_progress: &dyn Fn(f32)) -> R
 pub fn generate_click_track(bpm: f64, duration_secs: f64, sample_rate: u32) -> Clip {
     let interval_samples = (sample_rate as f64 * 60.0 / bpm) as usize;
     let total_samples = (sample_rate as f64 * duration_secs) as usize;
-    let click_len = (sample_rate as f64 * 0.015) as usize; // 15ms click
-
     let mut samples = vec![0.0_f32; total_samples];
 
     let mut pos = 0;
     while pos < total_samples {
+        let accented = pos == 0 || pos % (interval_samples * 4) < interval_samples;
+        let (freq, gain, decay, click_len) = if accented {
+            (1500.0, 1.0_f64, 200.0, (sample_rate as f64 * 0.025) as usize) // 25ms, louder
+        } else {
+            (1000.0, 0.45, 300.0, (sample_rate as f64 * 0.015) as usize) // 15ms, softer
+        };
         for i in 0..click_len.min(total_samples - pos) {
             let t = i as f64 / sample_rate as f64;
-            let envelope = (-t * 300.0).exp();
-            let freq = if pos == 0 || pos % (interval_samples * 4) < interval_samples {
-                1500.0 // accented beat
-            } else {
-                1000.0
-            };
-            samples[pos + i] = (2.0 * PI * freq * t).sin() as f32 * envelope as f32 * 0.8;
+            let envelope = (-t * decay).exp();
+            samples[pos + i] = (2.0 * PI * freq * t).sin() as f32 * envelope as f32 * gain as f32;
         }
         pos += interval_samples;
     }

@@ -494,6 +494,70 @@ impl App {
         self.window.as_ref().unwrap().set_title(&title);
     }
 
+    /// Export the project as a stereo WAV file by mixing down all non-muted tracks.
+    pub(crate) fn export_wav_to_path(&mut self, path: std::path::PathBuf) {
+        let channels = 2_u32;
+        let sample_rate = self.project_rate;
+        let max_dur = self.max_duration();
+        if max_dur <= 0.0 {
+            return;
+        }
+        let total_frames = (max_dur * sample_rate as f64).ceil() as usize;
+        let mut mix = vec![0.0_f32; total_frames * channels as usize];
+
+        for track in &self.tracks {
+            if track.muted {
+                continue;
+            }
+            for clip in &track.clips {
+                let frame_offset = (clip.offset_secs * sample_rate as f64) as usize;
+                let clip_frames = clip.mono.len(); // mono.len() == number of frames
+                let clip_ch = clip.channels as usize;
+
+                for f in 0..clip_frames {
+                    let out_f = frame_offset + f;
+                    if out_f >= total_frames {
+                        break;
+                    }
+                    if clip_ch == 1 {
+                        // Mono clip: copy to both channels
+                        let s = clip.samples[f];
+                        mix[out_f * 2] += s;
+                        mix[out_f * 2 + 1] += s;
+                    } else {
+                        // Multi-channel: take first two channels (or duplicate if mono)
+                        let si = f * clip_ch;
+                        mix[out_f * 2] += clip.samples[si];
+                        mix[out_f * 2 + 1] += clip.samples.get(si + 1).copied().unwrap_or(clip.samples[si]);
+                    }
+                }
+            }
+        }
+
+        let spec = hound::WavSpec {
+            channels: channels as u16,
+            sample_rate,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        match hound::WavWriter::create(&path, spec) {
+            Ok(mut writer) => {
+                for &s in &mix {
+                    if writer.write_sample(s).is_err() {
+                        eprintln!("Failed to write sample during export");
+                        return;
+                    }
+                }
+                if let Err(e) = writer.finalize() {
+                    eprintln!("Failed to finalize WAV export: {e}");
+                } else {
+                    eprintln!("Exported to {}", path.display());
+                }
+            }
+            Err(e) => eprintln!("Failed to create WAV file: {e}"),
+        }
+    }
+
     pub(crate) fn handle_modal_result(&mut self, result: modal::ModalResult) {
         match result {
             modal::ModalResult::ClickTrackBpm(bpm) => {

@@ -1,4 +1,5 @@
 use crate::app::{App, SelectionEdge, SELECTION_EDGE_PX};
+use crate::audio;
 
 impl App {
     /// Hit-test: find which (track_idx, clip_idx) is at pixel position (px, py)
@@ -91,6 +92,180 @@ impl App {
         } else {
             None
         }
+    }
+
+    /// Find all clip indices in a track that overlap the time range [s0, s1).
+    pub(crate) fn clips_overlapping_range(&self, track_idx: usize, s0: f64, s1: f64) -> Vec<usize> {
+        if track_idx >= self.tracks.len() {
+            return Vec::new();
+        }
+        self.tracks[track_idx]
+            .clips
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                let c_end = c.offset_secs + c.duration_secs();
+                s0 < c_end && s1 > c.offset_secs
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Copy the region [s0, s1) from all overlapping clips in a track.
+    /// Each returned clip is sliced to the selection bounds with offset_secs
+    /// relative to s0 (i.e. the first clip starts at 0.0 or later).
+    pub(crate) fn copy_region_clips(&self, track_idx: usize, s0: f64, s1: f64) -> Vec<audio::Clip> {
+        let indices = self.clips_overlapping_range(track_idx, s0, s1);
+        let mut result = Vec::new();
+        for idx in indices {
+            let clip = &self.tracks[track_idx].clips[idx];
+            let rel_start = (s0 - clip.offset_secs).max(0.0);
+            let rel_end = (s1 - clip.offset_secs).min(clip.duration_secs());
+            if rel_end > rel_start {
+                let mut sliced = clip.slice(rel_start, rel_end);
+                // Make offset relative to s0
+                sliced.offset_secs = (clip.offset_secs + rel_start) - s0;
+                result.push(sliced);
+            }
+        }
+        result
+    }
+
+    /// Remove the time range [s0, s1) from all overlapping clips in a track.
+    /// Processes indices in reverse to avoid invalidation.
+    pub(crate) fn remove_region_from_track(&mut self, track_idx: usize, s0: f64, s1: f64) {
+        let mut indices = self.clips_overlapping_range(track_idx, s0, s1);
+        indices.sort_unstable();
+        // Process in reverse order so indices stay valid
+        for &idx in indices.iter().rev() {
+            let clip = &self.tracks[track_idx].clips[idx];
+            let rel_start = (s0 - clip.offset_secs).max(0.0);
+            let rel_end = (s1 - clip.offset_secs).min(clip.duration_secs());
+            if rel_end <= rel_start {
+                continue;
+            }
+            let (left, right) = clip.remove_region(rel_start, rel_end);
+            self.tracks[track_idx].clips.remove(idx);
+            let mut insert_at = idx;
+            if let Some(l) = left {
+                self.tracks[track_idx].clips.insert(insert_at, l);
+                insert_at += 1;
+            }
+            if let Some(r) = right {
+                self.tracks[track_idx].clips.insert(insert_at, r);
+            }
+        }
+    }
+
+    /// Snap a group's outer edges against non-group clip edges.
+    /// `skip_clips` are the clip indices in the group.
+    /// `desired_left` is the desired offset of the leftmost group clip.
+    /// `group_span` is the distance from leftmost to rightmost+duration.
+    pub(crate) fn snap_offset_group(
+        &self, track_idx: usize, skip_clips: &[usize],
+        desired_left: f64, group_span: f64,
+    ) -> f64 {
+        let config = match self.config.as_ref() {
+            Some(c) => c,
+            None => return desired_left,
+        };
+        let view_duration = self.effective_view_duration();
+        let snap_secs = 10.0 / config.width as f64 * view_duration;
+
+        let group_start = desired_left;
+        let group_end = desired_left + group_span;
+
+        let mut best_offset = desired_left;
+        let mut best_dist = f64::MAX;
+
+        let track = &self.tracks[track_idx];
+        for (i, other) in track.clips.iter().enumerate() {
+            if skip_clips.contains(&i) {
+                continue;
+            }
+            let other_start = other.offset_secs;
+            let other_end = other.offset_secs + other.duration_secs();
+
+            // Group left edge snaps to other right edge
+            let d = (group_start - other_end).abs();
+            if d < snap_secs && d < best_dist {
+                best_dist = d;
+                best_offset = other_end;
+            }
+
+            // Group right edge snaps to other left edge
+            let d = (group_end - other_start).abs();
+            if d < snap_secs && d < best_dist {
+                best_dist = d;
+                best_offset = other_start - group_span;
+            }
+        }
+
+        best_offset
+    }
+
+    /// Clamp delta so no group clip overlaps a non-group clip.
+    /// Returns the clamped left offset for the group.
+    pub(crate) fn clamp_group_no_overlap(
+        &self, track_idx: usize, group_indices: &[usize],
+        group_orig_offsets: &[f64], desired_left: f64, orig_group_left: f64,
+    ) -> f64 {
+        let delta = desired_left - orig_group_left;
+        let track = &self.tracks[track_idx];
+
+        // Collect non-group clip intervals
+        let others: Vec<(f64, f64)> = track.clips.iter().enumerate()
+            .filter(|(i, _)| !group_indices.contains(i))
+            .map(|(_, c)| (c.offset_secs, c.offset_secs + c.duration_secs()))
+            .collect();
+
+        if others.is_empty() {
+            return desired_left.max(0.0 + (desired_left - orig_group_left - delta) + delta);
+        }
+
+        // Check if any group clip would overlap a non-group clip at this delta
+        let mut clamped_delta = delta;
+
+        // Try the desired delta, then clamp if overlapping
+        for (gi, &orig_off) in group_orig_offsets.iter().enumerate() {
+            let clip_idx = group_indices[gi];
+            let clip_dur = track.clips[clip_idx].duration_secs();
+            let new_start = orig_off + clamped_delta;
+            let new_end = new_start + clip_dur;
+
+            for &(os, oe) in &others {
+                if new_start < oe && new_end > os {
+                    // Overlap detected — clamp delta
+                    if clamped_delta > 0.0 {
+                        // Moving right: clamp so new_start = oe or new_end = os
+                        // We want to limit delta so that none of the group clips overlap
+                        let max_delta = (os - (orig_off + clip_dur)).min(clamped_delta);
+                        if max_delta < clamped_delta && max_delta >= 0.0 {
+                            clamped_delta = max_delta;
+                        } else if max_delta < 0.0 {
+                            clamped_delta = 0.0;
+                        }
+                    } else {
+                        // Moving left: clamp so new_end = os or new_start = oe
+                        let min_delta = (oe - orig_off).max(clamped_delta);
+                        if min_delta > clamped_delta && min_delta <= 0.0 {
+                            clamped_delta = min_delta;
+                        } else if min_delta > 0.0 {
+                            clamped_delta = 0.0;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Also clamp so no clip goes below 0
+        for &orig_off in group_orig_offsets {
+            if orig_off + clamped_delta < 0.0 {
+                clamped_delta = -orig_off;
+            }
+        }
+
+        orig_group_left + clamped_delta
     }
 
     /// Snap a clip's offset to nearby clip edges in the same track.
