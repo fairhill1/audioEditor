@@ -1,4 +1,5 @@
 mod audio;
+mod modal;
 mod playback;
 
 use std::sync::Arc;
@@ -48,6 +49,8 @@ struct App {
     // Horizontal zoom/scroll state
     view_start: f64,    // left edge in seconds
     view_duration: f64, // visible time span in seconds
+    modal: Option<modal::Modal>,
+    modal_input_width_px: f32,
     // Text rendering (glyphon)
     font_system: Option<FontSystem>,
     swash_cache: Option<SwashCache>,
@@ -74,6 +77,8 @@ impl App {
             selected_track: None,
             view_start: 0.0,
             view_duration: 0.0, // 0 means "show everything" until tracks are loaded
+            modal: None,
+            modal_input_width_px: 0.0,
             font_system: None,
             swash_cache: None,
             glyphon_cache: None,
@@ -358,6 +363,36 @@ impl App {
             }
         }
 
+        // Modal overlay
+        if self.modal.is_some() {
+            // Modal box (centered, fixed NDC size)
+            let box_w = 0.5;
+            let box_h = 0.25;
+            push_quad(&mut vertices, -box_w, -box_h, box_w, box_h, [0.18, 0.18, 0.22]);
+
+            // Border
+            let bw = 2.0 / width as f32;
+            let bh = 2.0 / height as f32;
+            let border_color = [0.4, 0.4, 0.5];
+            push_quad(&mut vertices, -box_w, box_h, box_w, box_h + bh, border_color); // top
+            push_quad(&mut vertices, -box_w, -box_h - bh, box_w, -box_h, border_color); // bottom
+            push_quad(&mut vertices, -box_w - bw, -box_h, -box_w, box_h, border_color); // left
+            push_quad(&mut vertices, box_w, -box_h, box_w + bw, box_h, border_color); // right
+
+            // Input field background
+            let field_w = 0.35;
+            let field_h = 0.06;
+            push_quad(&mut vertices, -field_w, -0.05, field_w, -0.05 + field_h, [0.12, 0.12, 0.15]);
+
+            // Cursor in input field — position derived from glyphon layout
+            let text_offset_ndc = self.modal_input_width_px / width as f32 * 2.0;
+            let pad_ndc = 8.0 * self.scale_factor() * 0.5 / width as f32 * 2.0;
+            let cursor_x = -field_w + pad_ndc + text_offset_ndc;
+            if cursor_x < field_w - pad_ndc {
+                push_quad(&mut vertices, cursor_x, -0.04, cursor_x + bw, -0.05 + field_h - 0.01, [0.7, 0.7, 0.8]);
+            }
+        }
+
         vertices
     }
 
@@ -396,6 +431,21 @@ impl App {
         self.window.as_ref().unwrap().set_title(&title);
     }
 
+    fn handle_modal_result(&mut self, result: modal::ModalResult) {
+        match result {
+            modal::ModalResult::ClickTrackBpm(bpm) => {
+                let sr = self.tracks.first().map_or(44100, |t| t.sample_rate);
+                let dur = if self.max_duration() > 0.0 { self.max_duration() } else { 30.0 };
+                let track = audio::generate_click_track(bpm, dur, sr);
+                self.tracks.push(track);
+                self.view_duration = self.max_duration();
+                self.view_start = 0.0;
+                self.rebuild_player();
+                self.update_title();
+            }
+        }
+    }
+
     fn render(&mut self) {
         let surface = self.surface.as_ref().unwrap();
         let device = self.device.as_ref().unwrap();
@@ -412,11 +462,11 @@ impl App {
         let padding_phys = 8.0 * scale;
 
         let mut text_buffers: Vec<Buffer> = Vec::new();
-        if !self.tracks.is_empty() {
-            let font_system = self.font_system.as_mut().unwrap();
-            let num_tracks = self.tracks.len();
-            let lane_height_px = height as f32 / num_tracks as f32;
+        let mut track_text_count = 0;
+        let font_system = self.font_system.as_mut().unwrap();
 
+        // Track title text buffers
+        if !self.tracks.is_empty() {
             for track in &self.tracks {
                 let mut buffer = Buffer::new(font_system, Metrics::new(font_size_phys, line_height_phys));
                 buffer.set_size(font_system, Some(width as f32 - padding_phys * 2.0), Some(title_bar_phys));
@@ -424,8 +474,41 @@ impl App {
                 buffer.shape_until_scroll(font_system, false);
                 text_buffers.push(buffer);
             }
+            track_text_count = self.tracks.len();
+        }
 
-            // Prepare glyphon
+        // Modal text buffers (title + input)
+        let modal_title_idx;
+        let modal_input_idx;
+        if let Some(modal) = &self.modal {
+            modal_title_idx = Some(text_buffers.len());
+            let modal_font_size = Self::FONT_SIZE_LP * scale * 1.1;
+            let modal_line_h = Self::LINE_HEIGHT_LP * scale * 1.1;
+            let mut title_buf = Buffer::new(font_system, Metrics::new(modal_font_size, modal_line_h));
+            title_buf.set_size(font_system, Some(width as f32 * 0.5), Some(modal_line_h * 2.0));
+            title_buf.set_text(font_system, &modal.title, &Attrs::new().family(Family::SansSerif), Shaping::Advanced, None);
+            title_buf.shape_until_scroll(font_system, false);
+            text_buffers.push(title_buf);
+
+            modal_input_idx = Some(text_buffers.len());
+            let display = if modal.input.is_empty() { " " } else { &modal.input };
+            let mut input_buf = Buffer::new(font_system, Metrics::new(font_size_phys, line_height_phys));
+            input_buf.set_size(font_system, Some(width as f32 * 0.35), Some(line_height_phys * 2.0));
+            input_buf.set_text(font_system, display, &Attrs::new().family(Family::Monospace), Shaping::Advanced, None);
+            input_buf.shape_until_scroll(font_system, false);
+            self.modal_input_width_px = input_buf
+                .layout_runs()
+                .next()
+                .map(|run| run.line_w)
+                .unwrap_or(0.0);
+            text_buffers.push(input_buf);
+        } else {
+            modal_title_idx = None;
+            modal_input_idx = None;
+        }
+
+        // Build all text areas
+        {
             let text_atlas = self.text_atlas.as_mut().unwrap();
             let text_renderer = self.text_renderer.as_mut().unwrap();
             let viewport = self.viewport.as_mut().unwrap();
@@ -434,28 +517,77 @@ impl App {
 
             viewport.update(queue, Resolution { width, height });
 
-            let text_areas: Vec<TextArea> = text_buffers
-                .iter()
-                .enumerate()
-                .map(|(idx, buf)| {
-                    let lane_top = idx as f32 * lane_height_px;
-                    let vert_pad = (title_bar_phys - line_height_phys) / 2.0;
-                    TextArea {
-                        buffer: buf,
-                        left: padding_phys,
-                        top: lane_top + vert_pad,
+            let num_tracks = self.tracks.len();
+            let lane_height_px = if num_tracks > 0 { height as f32 / num_tracks as f32 } else { 0.0 };
+
+            let mut text_areas: Vec<TextArea> = Vec::new();
+
+            // Track titles
+            for idx in 0..track_text_count {
+                let lane_top = idx as f32 * lane_height_px;
+                let vert_pad = (title_bar_phys - line_height_phys) / 2.0;
+                text_areas.push(TextArea {
+                    buffer: &text_buffers[idx],
+                    left: padding_phys,
+                    top: lane_top + vert_pad,
+                    scale: 1.0,
+                    bounds: TextBounds {
+                        left: 0,
+                        top: lane_top as i32,
+                        right: width as i32,
+                        bottom: (lane_top + title_bar_phys) as i32,
+                    },
+                    default_color: GlyphonColor::rgb(220, 220, 220),
+                    custom_glyphs: &[],
+                });
+            }
+
+            // Modal text areas
+            if let Some(ti) = modal_title_idx {
+                // Modal box is centered: NDC -0.5..0.5 horizontally, -0.25..0.25 vertically
+                // Convert NDC to pixel coords: px = (ndc + 1) / 2 * dimension
+                let box_left_px = ((-0.5 + 1.0) / 2.0) * width as f32;
+                let _box_top_px = ((-0.25 + 1.0) / 2.0) * height as f32;
+                // Flip Y: NDC top (0.25) → pixel top
+                let box_pixel_top = ((1.0 - 0.25) / 2.0) * height as f32;
+                let modal_line_h = Self::LINE_HEIGHT_LP * scale * 1.1;
+
+                text_areas.push(TextArea {
+                    buffer: &text_buffers[ti],
+                    left: box_left_px + padding_phys,
+                    top: box_pixel_top + padding_phys,
+                    scale: 1.0,
+                    bounds: TextBounds {
+                        left: box_left_px as i32,
+                        top: box_pixel_top as i32,
+                        right: (box_left_px + width as f32 * 0.5) as i32,
+                        bottom: (box_pixel_top + modal_line_h * 2.0) as i32,
+                    },
+                    default_color: GlyphonColor::rgb(220, 220, 220),
+                    custom_glyphs: &[],
+                });
+
+                if let Some(ii) = modal_input_idx {
+                    // Input field is at NDC y=-0.05..0.01, which in pixels is:
+                    let field_top_px = ((1.0 - (-0.05 + 0.06)) / 2.0) * height as f32;
+                    let field_left_px = ((-0.35 + 1.0) / 2.0) * width as f32;
+
+                    text_areas.push(TextArea {
+                        buffer: &text_buffers[ii],
+                        left: field_left_px + padding_phys * 0.5,
+                        top: field_top_px + padding_phys * 0.25,
                         scale: 1.0,
                         bounds: TextBounds {
-                            left: 0,
-                            top: lane_top as i32,
-                            right: width as i32,
-                            bottom: (lane_top + title_bar_phys) as i32,
+                            left: field_left_px as i32,
+                            top: field_top_px as i32,
+                            right: (field_left_px + width as f32 * 0.35) as i32,
+                            bottom: (field_top_px + line_height_phys * 2.0) as i32,
                         },
-                        default_color: GlyphonColor::rgb(220, 220, 220),
+                        default_color: GlyphonColor::rgb(200, 200, 210),
                         custom_glyphs: &[],
-                    }
-                })
-                .collect();
+                    });
+                }
+            }
 
             text_renderer
                 .prepare(device, queue, font_system, text_atlas, viewport, text_areas, swash_cache)
@@ -492,27 +624,25 @@ impl App {
                 ..Default::default()
             });
 
-            if !self.tracks.is_empty() {
-                let vertices = self.build_waveform_vertices(width, height);
-                if !vertices.is_empty() {
-                    let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("waveform_vertices"),
-                        contents: bytemuck::cast_slice(&vertices),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    });
-                    render_pass.set_pipeline(self.pipeline.as_ref().unwrap());
-                    render_pass.set_vertex_buffer(0, vbuf.slice(..));
-                    render_pass.draw(0..vertices.len() as u32, 0..1);
-                }
-
-                // Render track title text on top
-                let text_atlas = self.text_atlas.as_ref().unwrap();
-                let text_renderer = self.text_renderer.as_ref().unwrap();
-                let viewport = self.viewport.as_ref().unwrap();
-                text_renderer
-                    .render(text_atlas, viewport, &mut render_pass)
-                    .expect("Failed to render text");
+            let vertices = self.build_waveform_vertices(width, height);
+            if !vertices.is_empty() {
+                let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("waveform_vertices"),
+                    contents: bytemuck::cast_slice(&vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                render_pass.set_pipeline(self.pipeline.as_ref().unwrap());
+                render_pass.set_vertex_buffer(0, vbuf.slice(..));
+                render_pass.draw(0..vertices.len() as u32, 0..1);
             }
+
+            // Render text (track titles + modal text) on top
+            let text_atlas = self.text_atlas.as_ref().unwrap();
+            let text_renderer = self.text_renderer.as_ref().unwrap();
+            let viewport = self.viewport.as_ref().unwrap();
+            text_renderer
+                .render(text_atlas, viewport, &mut render_pass)
+                .expect("Failed to render text");
         }
 
         queue.submit(std::iter::once(encoder.finish()));
@@ -541,10 +671,82 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        // Modal input handling — intercepts all keyboard input when modal is open
+        if self.modal.as_ref().is_some_and(|m| m.visible) {
+            match &event {
+                WindowEvent::KeyboardInput { event: key_event, .. }
+                    if key_event.state == ElementState::Pressed =>
+                {
+                    match key_event.physical_key {
+                        PhysicalKey::Code(KeyCode::Escape) => {
+                            self.modal.as_mut().unwrap().cancel();
+                            self.modal = None;
+                            self.window.as_ref().unwrap().request_redraw();
+                        }
+                        PhysicalKey::Code(KeyCode::Backspace) => {
+                            self.modal.as_mut().unwrap().handle_backspace();
+                            self.window.as_ref().unwrap().request_redraw();
+                        }
+                        PhysicalKey::Code(KeyCode::Enter | KeyCode::NumpadEnter) => {
+                            // Fake a newline char to trigger confirm
+                            if let Some(result) = self.modal.as_mut().unwrap().handle_char('\n') {
+                                self.modal = None;
+                                self.handle_modal_result(result);
+                            }
+                            self.window.as_ref().unwrap().request_redraw();
+                        }
+                        _ => {
+                            if let Some(ref text) = key_event.text {
+                                for c in text.chars() {
+                                    if let Some(result) = self.modal.as_mut().unwrap().handle_char(c) {
+                                        self.modal = None;
+                                        self.handle_modal_result(result);
+                                        break;
+                                    }
+                                }
+                                self.window.as_ref().unwrap().request_redraw();
+                            }
+                        }
+                    }
+                    return;
+                }
+                _ => {}
+            }
+            // Still handle essential events while modal is open
+            match event {
+                WindowEvent::ModifiersChanged(mods) => {
+                    self.modifiers = mods.state();
+                }
+                WindowEvent::CloseRequested => event_loop.exit(),
+                WindowEvent::Resized(new_size) => {
+                    if let (Some(surface), Some(device), Some(config)) =
+                        (&self.surface, &self.device, &mut self.config)
+                    {
+                        config.width = new_size.width.max(1);
+                        config.height = new_size.height.max(1);
+                        surface.configure(device, config);
+                    }
+                    self.window.as_ref().unwrap().request_redraw();
+                }
+                WindowEvent::RedrawRequested => self.render(),
+                _ => {}
+            }
+            return;
+        }
+
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
+            }
+            // Cmd+G: Generate click track
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && event.physical_key == PhysicalKey::Code(KeyCode::KeyG)
+                    && self.modifiers.super_key() =>
+            {
+                self.modal = Some(modal::Modal::new("BPM", modal::ModalKind::ClickTrackBpm));
+                self.window.as_ref().unwrap().request_redraw();
             }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed

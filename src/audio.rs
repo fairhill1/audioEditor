@@ -1,3 +1,4 @@
+use std::f64::consts::PI;
 use std::fs::File;
 use std::path::Path;
 
@@ -165,4 +166,39 @@ pub fn load_file(path: &Path) -> Result<AudioTrack, Box<dyn std::error::Error>> 
         mono,
         summary,
     })
+}
+
+pub fn generate_click_track(bpm: f64, duration_secs: f64, sample_rate: u32) -> AudioTrack {
+    let interval_samples = (sample_rate as f64 * 60.0 / bpm) as usize;
+    let total_samples = (sample_rate as f64 * duration_secs) as usize;
+    let click_len = (sample_rate as f64 * 0.015) as usize; // 15ms click
+
+    let mut samples = vec![0.0_f32; total_samples];
+
+    let mut pos = 0;
+    while pos < total_samples {
+        for i in 0..click_len.min(total_samples - pos) {
+            let t = i as f64 / sample_rate as f64;
+            let envelope = (-t * 300.0).exp();
+            let freq = if pos == 0 || pos % (interval_samples * 4) < interval_samples {
+                1500.0 // accented beat
+            } else {
+                1000.0
+            };
+            samples[pos + i] = (2.0 * PI * freq * t).sin() as f32 * envelope as f32 * 0.8;
+        }
+        pos += interval_samples;
+    }
+
+    let mono = samples.clone();
+    let summary = AudioTrack::build_summary(&mono);
+
+    AudioTrack {
+        name: format!("Click — {bpm} BPM"),
+        samples,
+        sample_rate,
+        channels: 1,
+        mono,
+        summary,
+    }
 }
