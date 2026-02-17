@@ -1682,8 +1682,12 @@ impl ApplicationHandler for App {
                             track_idx, clip_idx, clip, track_was_removed,
                             prev_sel_track, prev_sel_clip,
                         });
-                        self.view_start = 0.0;
-                        self.view_duration = self.max_duration();
+                        // Clamp view to new duration without resetting zoom
+                        let max_dur = self.max_duration();
+                        if self.view_duration > max_dur {
+                            self.view_duration = max_dur;
+                        }
+                        self.view_start = self.view_start.clamp(0.0, (max_dur - self.view_duration).max(0.0));
                         self.rebuild_player();
                         self.update_title();
                         self.window.as_ref().unwrap().request_redraw();
