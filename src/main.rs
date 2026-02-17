@@ -21,6 +21,17 @@ struct Vertex {
     color: [f32; 3],
 }
 
+fn push_quad(vertices: &mut Vec<Vertex>, x0: f32, y0: f32, x1: f32, y1: f32, color: [f32; 3]) {
+    vertices.extend_from_slice(&[
+        Vertex { position: [x0, y1], color },
+        Vertex { position: [x1, y1], color },
+        Vertex { position: [x0, y0], color },
+        Vertex { position: [x0, y0], color },
+        Vertex { position: [x1, y1], color },
+        Vertex { position: [x1, y0], color },
+    ]);
+}
+
 struct App {
     window: Option<Arc<Window>>,
     surface: Option<wgpu::Surface<'static>>,
@@ -206,6 +217,10 @@ impl App {
         self.tracks.iter().map(|t| t.duration_secs()).fold(0.0_f64, f64::max)
     }
 
+    fn effective_view_duration(&self) -> f64 {
+        if self.view_duration > 0.0 { self.view_duration } else { self.max_duration() }
+    }
+
     fn build_waveform_vertices(&self, width: u32, height: u32) -> Vec<Vertex> {
         if self.tracks.is_empty() {
             return Vec::new();
@@ -229,7 +244,7 @@ impl App {
         let title_h = title_bar_physical / height as f32 * 2.0; // NDC height of title bar
 
         let view_start = self.view_start;
-        let view_duration = if self.view_duration > 0.0 { self.view_duration } else { self.max_duration() };
+        let view_duration = self.effective_view_duration();
         let view_end = view_start + view_duration;
 
         let mut vertices = Vec::new();
@@ -240,7 +255,6 @@ impl App {
 
             let lane_top = 1.0 - idx as f32 * lane_height;
             let lane_bot = lane_top - lane_height;
-            let lane_center = (lane_top + lane_bot) / 2.0;
 
             // Title bar background (brighter when selected)
             let title_top = lane_top;
@@ -250,37 +264,16 @@ impl App {
             } else {
                 TITLE_BG_COLOR
             };
-            vertices.extend_from_slice(&[
-                Vertex { position: [-1.0, title_top], color: title_color },
-                Vertex { position: [1.0, title_top], color: title_color },
-                Vertex { position: [-1.0, title_bot], color: title_color },
-                Vertex { position: [-1.0, title_bot], color: title_color },
-                Vertex { position: [1.0, title_top], color: title_color },
-                Vertex { position: [1.0, title_bot], color: title_color },
-            ]);
+            push_quad(&mut vertices, -1.0, title_bot, 1.0, title_top, title_color);
 
             // Center line for this track (in waveform area, below title bar)
             let wave_top_here = title_bot;
             let wave_center_here = (wave_top_here + lane_bot) / 2.0;
-            vertices.extend_from_slice(&[
-                Vertex { position: [-1.0, wave_center_here + line_h], color: center_color },
-                Vertex { position: [1.0, wave_center_here + line_h], color: center_color },
-                Vertex { position: [-1.0, wave_center_here - line_h], color: center_color },
-                Vertex { position: [-1.0, wave_center_here - line_h], color: center_color },
-                Vertex { position: [1.0, wave_center_here + line_h], color: center_color },
-                Vertex { position: [1.0, wave_center_here - line_h], color: center_color },
-            ]);
+            push_quad(&mut vertices, -1.0, wave_center_here - line_h, 1.0, wave_center_here + line_h, center_color);
 
             // Divider line between tracks
             if idx > 0 {
-                vertices.extend_from_slice(&[
-                    Vertex { position: [-1.0, lane_top + line_h], color: DIVIDER_COLOR },
-                    Vertex { position: [1.0, lane_top + line_h], color: DIVIDER_COLOR },
-                    Vertex { position: [-1.0, lane_top - line_h], color: DIVIDER_COLOR },
-                    Vertex { position: [-1.0, lane_top - line_h], color: DIVIDER_COLOR },
-                    Vertex { position: [1.0, lane_top + line_h], color: DIVIDER_COLOR },
-                    Vertex { position: [1.0, lane_top - line_h], color: DIVIDER_COLOR },
-                ]);
+                push_quad(&mut vertices, -1.0, lane_top - line_h, 1.0, lane_top + line_h, DIVIDER_COLOR);
             }
 
             // Waveform — only draw samples visible in the current view window
@@ -327,14 +320,7 @@ impl App {
                     let y_top = wave_center + max_val * half_wave;
                     let y_bot = wave_center + min_val * half_wave;
 
-                    vertices.extend_from_slice(&[
-                        Vertex { position: [x0, y_top], color },
-                        Vertex { position: [x1, y_top], color },
-                        Vertex { position: [x0, y_bot], color },
-                        Vertex { position: [x0, y_bot], color },
-                        Vertex { position: [x1, y_top], color },
-                        Vertex { position: [x1, y_bot], color },
-                    ]);
+                    push_quad(&mut vertices, x0, y_bot, x1, y_top, color);
                 }
             }
         }
@@ -349,14 +335,7 @@ impl App {
             let track_bg = [0.15, 0.15, 0.18];
             let bar_top = -1.0 + bar_ndc_h;
             let bar_bot = -1.0_f32;
-            vertices.extend_from_slice(&[
-                Vertex { position: [-1.0, bar_top], color: track_bg },
-                Vertex { position: [1.0, bar_top], color: track_bg },
-                Vertex { position: [-1.0, bar_bot], color: track_bg },
-                Vertex { position: [-1.0, bar_bot], color: track_bg },
-                Vertex { position: [1.0, bar_top], color: track_bg },
-                Vertex { position: [1.0, bar_bot], color: track_bg },
-            ]);
+            push_quad(&mut vertices, -1.0, bar_bot, 1.0, bar_top, track_bg);
 
             // Thumb (shows visible portion)
             let thumb_left = (view_start / max_dur) as f32;
@@ -364,14 +343,7 @@ impl App {
             let thumb_x0 = thumb_left * 2.0 - 1.0;
             let thumb_x1 = thumb_right * 2.0 - 1.0;
             let thumb_color = [0.4, 0.4, 0.45];
-            vertices.extend_from_slice(&[
-                Vertex { position: [thumb_x0, bar_top], color: thumb_color },
-                Vertex { position: [thumb_x1, bar_top], color: thumb_color },
-                Vertex { position: [thumb_x0, bar_bot], color: thumb_color },
-                Vertex { position: [thumb_x0, bar_bot], color: thumb_color },
-                Vertex { position: [thumb_x1, bar_top], color: thumb_color },
-                Vertex { position: [thumb_x1, bar_bot], color: thumb_color },
-            ]);
+            push_quad(&mut vertices, thumb_x0, bar_bot, thumb_x1, bar_top, thumb_color);
         }
 
         // Playhead
@@ -382,15 +354,7 @@ impl App {
             if ndc_frac >= 0.0 && ndc_frac <= 1.0 {
                 let x = ndc_frac * 2.0 - 1.0;
                 let hw = 1.0 / width as f32;
-                let playhead_color = [1.0_f32, 1.0, 1.0];
-                vertices.extend_from_slice(&[
-                    Vertex { position: [x - hw, 1.0], color: playhead_color },
-                    Vertex { position: [x + hw, 1.0], color: playhead_color },
-                    Vertex { position: [x - hw, -1.0], color: playhead_color },
-                    Vertex { position: [x - hw, -1.0], color: playhead_color },
-                    Vertex { position: [x + hw, 1.0], color: playhead_color },
-                    Vertex { position: [x + hw, -1.0], color: playhead_color },
-                ]);
+                push_quad(&mut vertices, x - hw, -1.0, x + hw, 1.0, [1.0, 1.0, 1.0]);
             }
         }
 
@@ -638,7 +602,7 @@ impl ApplicationHandler for App {
                 // Seek
                 if let (Some(player), Some(config)) = (&self.player, &self.config) {
                     let cursor_frac = self.cursor_x / config.width as f64;
-                    let view_dur = if self.view_duration > 0.0 { self.view_duration } else { self.max_duration() };
+                    let view_dur = self.effective_view_duration();
                     let click_secs = self.view_start + cursor_frac * view_dur;
                     let max_dur = self.max_duration();
                     if max_dur > 0.0 {
@@ -651,7 +615,7 @@ impl ApplicationHandler for App {
             WindowEvent::MouseWheel { delta, .. } if !self.modifiers.super_key() => {
                 if !self.tracks.is_empty() {
                     let max_dur = self.max_duration();
-                    let view_dur = if self.view_duration > 0.0 { self.view_duration } else { max_dur };
+                    let view_dur = self.effective_view_duration();
 
                     let (dx, dy) = match delta {
                         winit::event::MouseScrollDelta::PixelDelta(pos) => (pos.x, pos.y),
@@ -671,7 +635,7 @@ impl ApplicationHandler for App {
             WindowEvent::MouseWheel { delta, .. } if self.modifiers.super_key() => {
                 if !self.tracks.is_empty() {
                     let max_dur = self.max_duration();
-                    let view_dur = if self.view_duration > 0.0 { self.view_duration } else { max_dur };
+                    let view_dur = self.effective_view_duration();
 
                     let dy = match delta {
                         winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y,
@@ -693,7 +657,7 @@ impl ApplicationHandler for App {
             WindowEvent::PinchGesture { delta, .. } => {
                 if !self.tracks.is_empty() {
                     let max_dur = self.max_duration();
-                    let view_dur = if self.view_duration > 0.0 { self.view_duration } else { max_dur };
+                    let view_dur = self.effective_view_duration();
 
                     let zoom_factor = 1.0 + delta;
                     let new_dur = (view_dur / zoom_factor).clamp(0.01, max_dur);
