@@ -89,6 +89,20 @@ pub fn save_project(
     let ron_str = ron::ser::to_string_pretty(&project, ron::ser::PrettyConfig::default())?;
     fs::write(ron_path, ron_str)?;
 
+    // Remove orphaned WAV files from the audio folder
+    let audio_path = dir.join(&audio_dir);
+    let referenced: std::collections::HashSet<_> = written.values()
+        .map(|rel| dir.join(rel))
+        .collect();
+    if let Ok(entries) = fs::read_dir(&audio_path) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "wav") && !referenced.contains(&path) {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+
     Ok(())
 }
 
