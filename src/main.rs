@@ -2,7 +2,8 @@ mod audio;
 mod modal;
 mod playback;
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 
 use glyphon::{
     Attrs, Buffer, Cache, Color as GlyphonColor, Family, FontSystem, Metrics, Resolution,
@@ -33,6 +34,11 @@ fn push_quad(vertices: &mut Vec<Vertex>, x0: f32, y0: f32, x1: f32, y1: f32, col
     ]);
 }
 
+struct PendingLoad {
+    result: Arc<Mutex<Option<Result<audio::AudioTrack, String>>>>,
+    progress: Arc<AtomicU8>,
+}
+
 struct App {
     window: Option<Arc<Window>>,
     surface: Option<wgpu::Surface<'static>>,
@@ -51,6 +57,8 @@ struct App {
     view_duration: f64, // visible time span in seconds
     modal: Option<modal::Modal>,
     modal_input_width_px: f32,
+    project_rate: u32,
+    loading: Option<PendingLoad>,
     // Text rendering (glyphon)
     font_system: Option<FontSystem>,
     swash_cache: Option<SwashCache>,
@@ -79,6 +87,8 @@ impl App {
             view_duration: 0.0, // 0 means "show everything" until tracks are loaded
             modal: None,
             modal_input_width_px: 0.0,
+            project_rate: 48_000,
+            loading: None,
             font_system: None,
             swash_cache: None,
             glyphon_cache: None,
@@ -401,24 +411,69 @@ impl App {
     }
 
     fn open_file(&mut self) {
+        if self.loading.is_some() {
+            return; // already loading
+        }
+
         let file = rfd::FileDialog::new()
             .add_filter("Audio", &["wav", "mp3", "flac", "ogg", "m4a", "aac"])
             .pick_file();
 
         if let Some(path) = file {
-            match audio::load_file(&path) {
-                Ok(track) => {
-                    self.tracks.push(track);
-                    self.view_duration = self.max_duration();
-                    self.view_start = 0.0;
-                    self.rebuild_player();
-                    self.update_title();
-                    self.window.as_ref().unwrap().request_redraw();
+            let result: Arc<Mutex<Option<Result<audio::AudioTrack, String>>>> =
+                Arc::new(Mutex::new(None));
+            let progress = Arc::new(AtomicU8::new(0));
+
+            let result_clone = result.clone();
+            let progress_clone = progress.clone();
+            let project_rate = self.project_rate;
+
+            std::thread::spawn(move || {
+                let on_progress = move |frac: f32| {
+                    progress_clone.store((frac * 100.0) as u8, Ordering::Relaxed);
+                };
+                let res = audio::load_file(&path, project_rate, &on_progress)
+                    .map_err(|e| e.to_string());
+                *result_clone.lock().unwrap() = Some(res);
+            });
+
+            self.loading = Some(PendingLoad { result, progress });
+            self.window.as_ref().unwrap().set_title("Loading…");
+        }
+    }
+
+    fn poll_loading(&mut self) {
+        let done = if let Some(pending) = &self.loading {
+            let lock = pending.result.lock().unwrap();
+            if let Some(res) = &*lock {
+                match res {
+                    Ok(_) => true,
+                    Err(e) => {
+                        eprintln!("Failed to load audio: {e}");
+                        true
+                    }
                 }
-                Err(e) => {
-                    eprintln!("Failed to load audio: {e}");
-                }
+            } else {
+                // Still loading — update title with progress
+                let pct = pending.progress.load(Ordering::Relaxed);
+                self.window.as_ref().unwrap().set_title(&format!("Resampling… {pct}%"));
+                false
             }
+        } else {
+            return;
+        };
+
+        if done {
+            let pending = self.loading.take().unwrap();
+            let res = pending.result.lock().unwrap().take().unwrap();
+            if let Ok(track) = res {
+                self.tracks.push(track);
+                self.view_duration = self.max_duration();
+                self.view_start = 0.0;
+                self.rebuild_player();
+            }
+            self.update_title();
+            self.window.as_ref().unwrap().request_redraw();
         }
     }
 
@@ -426,7 +481,8 @@ impl App {
         let title = if self.tracks.is_empty() {
             "Audio Editor".to_string()
         } else {
-            format!("Audio Editor — {} track(s)", self.tracks.len())
+            let rate_khz = self.project_rate as f64 / 1000.0;
+            format!("Audio Editor — {} track(s) — {rate_khz:.1}kHz", self.tracks.len())
         };
         self.window.as_ref().unwrap().set_title(&title);
     }
@@ -434,9 +490,8 @@ impl App {
     fn handle_modal_result(&mut self, result: modal::ModalResult) {
         match result {
             modal::ModalResult::ClickTrackBpm(bpm) => {
-                let sr = self.tracks.first().map_or(44100, |t| t.sample_rate);
                 let dur = if self.max_duration() > 0.0 { self.max_duration() } else { 30.0 };
-                let track = audio::generate_click_track(bpm, dur, sr);
+                let track = audio::generate_click_track(bpm, dur, self.project_rate);
                 self.tracks.push(track);
                 self.view_duration = self.max_duration();
                 self.view_start = 0.0;
@@ -663,7 +718,10 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(player) = &self.player {
+        self.poll_loading();
+        if self.loading.is_some() {
+            self.window.as_ref().unwrap().request_redraw();
+        } else if let Some(player) = &self.player {
             if player.is_playing() {
                 self.window.as_ref().unwrap().request_redraw();
             }

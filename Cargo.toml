@@ -11,6 +11,8 @@ glyphon = "0.10.0"
 log = "0.4.29"
 pollster = "0.4.0"
 rfd = "0.17.2"
+audioadapter-buffers = "2.0"
+rubato = "1.0.1"
 symphonia = { version = "0.5.5", features = ["mp3", "wav", "pcm", "isomp4", "aac"] }
 wgpu = "28.0.0"
 winit = "0.30.12"

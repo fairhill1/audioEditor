@@ -2,6 +2,8 @@ use std::f64::consts::PI;
 use std::fs::File;
 use std::path::Path;
 
+use audioadapter_buffers::direct::InterleavedSlice;
+use rubato::{FixedSync, Fft, Indexing, Resampler};
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::formats::FormatOptions;
@@ -91,7 +93,52 @@ impl AudioTrack {
     }
 }
 
-pub fn load_file(path: &Path) -> Result<AudioTrack, Box<dyn std::error::Error>> {
+fn resample(samples: &[f32], channels: u32, from_rate: u32, to_rate: u32, on_progress: &dyn Fn(f32)) -> Vec<f32> {
+    let ch = channels as usize;
+    let in_frames = samples.len() / ch;
+
+    let mut resampler =
+        Fft::<f32>::new(from_rate as usize, to_rate as usize, 1024, 1, ch, FixedSync::Input)
+            .expect("Failed to create resampler");
+
+    let out_frames_max = (in_frames as f64 * to_rate as f64 / from_rate as f64).ceil() as usize
+        + resampler.output_frames_max();
+    let mut output = vec![0.0_f32; out_frames_max * ch];
+
+    let input_adapter = InterleavedSlice::new(samples, ch, in_frames).unwrap();
+    let mut output_adapter =
+        InterleavedSlice::new_mut(&mut output, ch, out_frames_max).unwrap();
+
+    let mut indexing = Indexing {
+        input_offset: 0,
+        output_offset: 0,
+        partial_len: None,
+        active_channels_mask: None,
+    };
+
+    let mut remaining = in_frames;
+    while remaining > 0 {
+        let needed = resampler.input_frames_next();
+        if remaining < needed {
+            indexing.partial_len = Some(remaining);
+        }
+        let (consumed, produced) = resampler
+            .process_into_buffer(&input_adapter, &mut output_adapter, Some(&indexing))
+            .expect("Resample failed");
+        indexing.input_offset += consumed;
+        indexing.output_offset += produced;
+        remaining = remaining.saturating_sub(consumed);
+        if consumed == 0 {
+            break;
+        }
+        on_progress(1.0 - remaining as f32 / in_frames as f32);
+    }
+
+    output.truncate(indexing.output_offset * ch);
+    output
+}
+
+pub fn load_file(path: &Path, project_rate: u32, on_progress: &dyn Fn(f32)) -> Result<AudioTrack, Box<dyn std::error::Error>> {
     let file = File::open(path)?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
@@ -148,6 +195,12 @@ pub fn load_file(path: &Path) -> Result<AudioTrack, Box<dyn std::error::Error>> 
         buf.copy_interleaved_ref(decoded);
         samples.extend_from_slice(buf.samples());
     }
+
+    let (samples, sample_rate) = if sample_rate != project_rate {
+        (resample(&samples, channels, sample_rate, project_rate, on_progress), project_rate)
+    } else {
+        (samples, sample_rate)
+    };
 
     let mono = AudioTrack::build_mono(&samples, channels);
     let summary = AudioTrack::build_summary(&mono);
