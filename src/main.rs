@@ -1,7 +1,9 @@
 mod audio;
 mod modal;
 mod playback;
+mod project;
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -63,6 +65,7 @@ struct App {
     config: Option<wgpu::SurfaceConfiguration>,
     pipeline: Option<wgpu::RenderPipeline>,
     tracks: Vec<audio::Track>,
+    project_path: Option<PathBuf>,
     player: Option<playback::Player>,
     modifiers: ModifiersState,
     cursor_x: f64,
@@ -96,6 +99,7 @@ impl App {
             config: None,
             pipeline: None,
             tracks: Vec::new(),
+            project_path: None,
             player: None,
             modifiers: ModifiersState::empty(),
             cursor_x: 0.0,
@@ -663,6 +667,58 @@ impl App {
         }
     }
 
+    fn save_project(&mut self) {
+        let path = if let Some(ref path) = self.project_path {
+            path.clone()
+        } else {
+            self.save_project_as();
+            return;
+        };
+        match project::save_project(&path, &self.tracks, self.project_rate) {
+            Ok(()) => self.update_title(),
+            Err(e) => eprintln!("Failed to save project: {e}"),
+        }
+    }
+
+    fn save_project_as(&mut self) {
+        let file = rfd::FileDialog::new()
+            .set_title("Save Project")
+            .set_file_name("project.ron")
+            .add_filter("Project", &["ron"])
+            .save_file();
+        if let Some(file) = file {
+            self.project_path = Some(file.clone());
+            match project::save_project(&file, &self.tracks, self.project_rate) {
+                Ok(()) => self.update_title(),
+                Err(e) => eprintln!("Failed to save project: {e}"),
+            }
+        }
+    }
+
+    fn open_project(&mut self) {
+        let file = rfd::FileDialog::new()
+            .set_title("Open Project")
+            .add_filter("Project", &["ron"])
+            .pick_file();
+        if let Some(file) = file {
+            match project::load_project(&file) {
+                Ok((tracks, rate)) => {
+                    self.tracks = tracks;
+                    self.project_rate = rate;
+                    self.project_path = Some(file);
+                    self.selected_track = None;
+                    self.selected_clip = None;
+                    self.view_start = 0.0;
+                    self.view_duration = self.max_duration();
+                    self.rebuild_player();
+                    self.update_title();
+                    self.window.as_ref().unwrap().request_redraw();
+                }
+                Err(e) => eprintln!("Failed to load project: {e}"),
+            }
+        }
+    }
+
     fn poll_loading(&mut self) {
         let done = if let Some(pending) = &self.loading {
             let lock = pending.result.lock().unwrap();
@@ -716,11 +772,15 @@ impl App {
     }
 
     fn update_title(&self) {
+        let project_name = self.project_path.as_ref()
+            .and_then(|p| p.file_stem())
+            .and_then(|n| n.to_str())
+            .unwrap_or("Untitled");
         let title = if self.tracks.is_empty() {
-            "Audio Editor".to_string()
+            format!("Audio Editor — {project_name}")
         } else {
             let rate_khz = self.project_rate as f64 / 1000.0;
-            format!("Audio Editor — {} track(s) — {rate_khz:.1}kHz", self.tracks.len())
+            format!("Audio Editor — {project_name} — {} track(s) — {rate_khz:.1}kHz", self.tracks.len())
         };
         self.window.as_ref().unwrap().set_title(&title);
     }
@@ -1100,12 +1160,39 @@ impl ApplicationHandler for App {
                 self.modal = Some(modal::Modal::new("BPM", modal::ModalKind::ClickTrackBpm));
                 self.window.as_ref().unwrap().request_redraw();
             }
+            // Cmd+O: Open project
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed
                     && event.physical_key == PhysicalKey::Code(KeyCode::KeyO)
                     && self.modifiers.super_key() =>
             {
+                self.open_project();
+            }
+            // Cmd+I: Import audio file
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && event.physical_key == PhysicalKey::Code(KeyCode::KeyI)
+                    && self.modifiers.super_key() =>
+            {
                 self.open_file();
+            }
+            // Cmd+S: Save project
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && event.physical_key == PhysicalKey::Code(KeyCode::KeyS)
+                    && self.modifiers.super_key()
+                    && !self.modifiers.shift_key() =>
+            {
+                self.save_project();
+            }
+            // Cmd+Shift+S: Save project as
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && event.physical_key == PhysicalKey::Code(KeyCode::KeyS)
+                    && self.modifiers.super_key()
+                    && self.modifiers.shift_key() =>
+            {
+                self.save_project_as();
             }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed

@@ -22,6 +22,8 @@ pub struct Clip {
     pub summary: Vec<(f32, f32)>,
     /// Position of this clip on the timeline in seconds
     pub offset_secs: f64,
+    /// Original source file path (for project save metadata)
+    pub source_path: Option<String>,
 }
 
 /// Samples per summary bucket — tune for a good balance of detail vs speed
@@ -32,7 +34,7 @@ impl Clip {
         self.mono.len() as f64 / self.sample_rate as f64
     }
 
-    fn build_mono(samples: &[f32], channels: u32) -> Vec<f32> {
+    pub fn build_mono(samples: &[f32], channels: u32) -> Vec<f32> {
         let ch = channels as usize;
         (0..samples.len() / ch)
             .map(|i| {
@@ -45,7 +47,7 @@ impl Clip {
             .collect()
     }
 
-    fn build_summary(mono: &[f32]) -> Vec<(f32, f32)> {
+    pub fn build_summary(mono: &[f32]) -> Vec<(f32, f32)> {
         mono.chunks(SUMMARY_BUCKET)
             .map(|chunk| {
                 let mut min = f32::MAX;
@@ -79,6 +81,7 @@ impl Clip {
             mono: right_mono,
             summary: right_summary,
             offset_secs: self.offset_secs + secs,
+            source_path: self.source_path.clone(),
         }
     }
 
@@ -257,6 +260,7 @@ pub fn load_file(path: &Path, project_rate: u32, on_progress: &dyn Fn(f32)) -> R
         mono,
         summary,
         offset_secs: 0.0,
+        source_path: Some(path.to_string_lossy().into_owned()),
     })
 }
 
@@ -293,5 +297,6 @@ pub fn generate_click_track(bpm: f64, duration_secs: f64, sample_rate: u32) -> C
         mono,
         summary,
         offset_secs: 0.0,
+        source_path: None,
     }
 }
