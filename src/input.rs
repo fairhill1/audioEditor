@@ -734,6 +734,26 @@ impl ApplicationHandler for App {
                         return;
                     }
 
+                    if self.modifiers.shift_key()
+                        && self.selected_track == Some(track_idx)
+                        && self.selected_clip.is_some()
+                    {
+                        // Shift+Click: select all clips between anchor and clicked clip by timeline position
+                        let anchor = self.selected_clip.unwrap();
+                        let clips = &self.tracks[track_idx].clips;
+                        let a_off = clips[anchor].offset_secs;
+                        let b_off = clips[clip_idx].offset_secs;
+                        let (lo, hi) = if a_off <= b_off { (a_off, b_off) } else { (b_off, a_off) };
+                        self.multi_selected_clips = clips.iter().enumerate()
+                            .filter(|(_, c)| c.offset_secs >= lo && c.offset_secs <= hi)
+                            .map(|(i, _)| i)
+                            .collect();
+                        self.selected_clip = Some(clip_idx);
+                        self.selection = None;
+                        self.window.as_ref().unwrap().request_redraw();
+                        return;
+                    }
+
                     self.selected_track = Some(track_idx);
                     self.selected_clip = Some(clip_idx);
 
