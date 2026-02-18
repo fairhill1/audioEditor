@@ -25,6 +25,8 @@ pub struct Clip {
     pub offset_secs: f64,
     /// Original source file path (for project save metadata)
     pub source_path: Option<String>,
+    /// Linear gain multiplier (1.0 = unity, default)
+    pub gain: f32,
 }
 
 /// Samples per summary bucket — tune for a good balance of detail vs speed
@@ -33,6 +35,10 @@ const SUMMARY_BUCKET: usize = 256;
 impl Clip {
     pub fn duration_secs(&self) -> f64 {
         self.mono.len() as f64 / self.sample_rate as f64
+    }
+
+    pub fn gain_db(&self) -> f32 {
+        20.0 * self.gain.log10()
     }
 
     pub fn build_mono(samples: &[f32], channels: u32) -> Vec<f32> {
@@ -83,6 +89,7 @@ impl Clip {
             summary: right_summary,
             offset_secs: self.offset_secs + secs,
             source_path: self.source_path.clone(),
+            gain: self.gain,
         }
     }
 
@@ -107,6 +114,7 @@ impl Clip {
             summary,
             offset_secs: self.offset_secs + start_secs,
             source_path: self.source_path.clone(),
+            gain: self.gain,
         }
     }
 
@@ -308,6 +316,7 @@ pub fn load_file(path: &Path, project_rate: u32, on_progress: &dyn Fn(f32)) -> R
         summary,
         offset_secs: 0.0,
         source_path: Some(path.to_string_lossy().into_owned()),
+        gain: 1.0,
     })
 }
 
@@ -344,5 +353,6 @@ pub fn generate_click_track(bpm: f64, duration_secs: f64, sample_rate: u32) -> C
         summary,
         offset_secs: 0.0,
         source_path: None,
+        gain: 1.0,
     }
 }

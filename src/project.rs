@@ -31,6 +31,7 @@ pub struct ClipEntry {
     pub offset: f64,
     pub sample_rate: u32,
     pub channels: u32,
+    pub gain: f32,
 }
 
 fn audio_dir_name(ron_path: &Path) -> String {
@@ -77,6 +78,7 @@ pub fn save_project(
                 offset: clip.offset_secs,
                 sample_rate: clip.sample_rate,
                 channels: clip.channels,
+                gain: clip.gain,
             });
         }
 
@@ -134,6 +136,7 @@ pub fn load_project(ron_path: &Path) -> Result<(Vec<audio::Track>, u32), Box<dyn
                 summary,
                 offset_secs: clip_entry.offset,
                 source_path: clip_entry.source.clone(),
+                gain: clip_entry.gain,
             });
         }
 

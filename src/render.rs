@@ -289,6 +289,8 @@ impl App {
                     }
 
                     let (min_val, max_val) = clip.min_max_range(start, end);
+                    let min_val = min_val * clip.gain;
+                    let max_val = max_val * clip.gain;
 
                     let x0 = (x_offset + col as f32 / width as f32) * 2.0 - 1.0;
                     let x1 = (x_offset + (col + 1) as f32 / width as f32) * 2.0 - 1.0;
@@ -407,9 +409,16 @@ impl App {
                     let clip_right_px = ((vis_end - view_start) / view_duration) as f32 * width as f32;
                     let clip_width_px = clip_right_px - clip_left_px;
 
+                    let display_name = if (clip.gain - 1.0).abs() > 1e-4 {
+                        let db = clip.gain_db();
+                        let sign = if db >= 0.0 { "+" } else { "" };
+                        format!("{} [{sign}{db:.1} dB]", clip.name)
+                    } else {
+                        clip.name.clone()
+                    };
                     let mut buffer = Buffer::new(font_system, Metrics::new(font_size_phys, line_height_phys));
                     buffer.set_size(font_system, Some((clip_width_px - padding_phys * 2.0).max(0.0)), Some(title_bar_phys));
-                    buffer.set_text(font_system, &clip.name, &Attrs::new().family(Family::SansSerif), Shaping::Advanced, None);
+                    buffer.set_text(font_system, &display_name, &Attrs::new().family(Family::SansSerif), Shaping::Advanced, None);
                     buffer.shape_until_scroll(font_system, false);
                     text_buffers.push(buffer);
                     clip_text_positions.push((track_idx, clip_left_px, clip_width_px));

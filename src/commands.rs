@@ -324,6 +324,16 @@ impl App {
                     prev_sel_track: cur_sel_track, prev_sel_clip: cur_sel_clip,
                 }
             }
+            undo::UndoAction::AdjustGain {
+                track_idx, clip_idx, old_gain, new_gain,
+            } => {
+                self.tracks[track_idx].clips[clip_idx].gain = old_gain;
+                undo::UndoAction::AdjustGain {
+                    track_idx, clip_idx,
+                    old_gain: new_gain,
+                    new_gain: old_gain,
+                }
+            }
         }
     }
 
@@ -514,21 +524,20 @@ impl App {
                 let clip_frames = clip.mono.len(); // mono.len() == number of frames
                 let clip_ch = clip.channels as usize;
 
+                let gain = clip.gain;
                 for f in 0..clip_frames {
                     let out_f = frame_offset + f;
                     if out_f >= total_frames {
                         break;
                     }
                     if clip_ch == 1 {
-                        // Mono clip: copy to both channels
-                        let s = clip.samples[f];
+                        let s = clip.samples[f] * gain;
                         mix[out_f * 2] += s;
                         mix[out_f * 2 + 1] += s;
                     } else {
-                        // Multi-channel: take first two channels (or duplicate if mono)
                         let si = f * clip_ch;
-                        mix[out_f * 2] += clip.samples[si];
-                        mix[out_f * 2 + 1] += clip.samples.get(si + 1).copied().unwrap_or(clip.samples[si]);
+                        mix[out_f * 2] += clip.samples[si] * gain;
+                        mix[out_f * 2 + 1] += clip.samples.get(si + 1).copied().unwrap_or(clip.samples[si]) * gain;
                     }
                 }
             }

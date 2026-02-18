@@ -553,6 +553,46 @@ impl ApplicationHandler for App {
                     }
                 }
             }
+            // Cmd+Up/Down: Adjust gain on selected clip(s)
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && self.modifiers.super_key()
+                    && matches!(
+                        event.physical_key,
+                        PhysicalKey::Code(KeyCode::ArrowUp) | PhysicalKey::Code(KeyCode::ArrowDown)
+                    ) =>
+            {
+                if let (Some(track_idx), Some(clip_idx)) = (self.selected_track, self.selected_clip) {
+                    if track_idx < self.tracks.len() && clip_idx < self.tracks[track_idx].clips.len() {
+                        let step_db: f32 = if self.modifiers.shift_key() { 0.1 } else { 1.0 };
+                        let dir: f32 = if event.physical_key == PhysicalKey::Code(KeyCode::ArrowUp) { 1.0 } else { -1.0 };
+
+                        // Collect clip indices to adjust: multi-selection or single
+                        let indices: Vec<usize> = if !self.multi_selected_clips.is_empty() {
+                            self.multi_selected_clips.clone()
+                        } else {
+                            vec![clip_idx]
+                        };
+
+                        for &ci in &indices {
+                            if ci < self.tracks[track_idx].clips.len() {
+                                let clip = &self.tracks[track_idx].clips[ci];
+                                let old_gain = clip.gain;
+                                let old_db = clip.gain_db();
+                                let new_db = (old_db + step_db * dir).clamp(-60.0, 24.0);
+                                let new_gain = 10.0_f32.powf(new_db / 20.0);
+                                self.tracks[track_idx].clips[ci].gain = new_gain;
+                                self.undo_manager.push(undo::UndoAction::AdjustGain {
+                                    track_idx, clip_idx: ci, old_gain, new_gain,
+                                });
+                            }
+                        }
+                        self.rebuild_player();
+                        self.update_title();
+                        self.window.as_ref().unwrap().request_redraw();
+                    }
+                }
+            }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed
                     && matches!(

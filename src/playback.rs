@@ -53,6 +53,7 @@ impl Player {
                 let frames = clip.samples.len() / ch;
                 let offset_frames = (clip.offset_secs * sample_rate as f64) as usize;
 
+                let gain = clip.gain;
                 for f in 0..frames {
                     let out_f = offset_frames + f;
                     if out_f >= max_frames as usize {
@@ -61,11 +62,11 @@ impl Player {
                     let left;
                     let right;
                     if ch == 1 {
-                        left = clip.samples[f];
+                        left = clip.samples[f] * gain;
                         right = left;
                     } else {
-                        left = clip.samples[f * ch];
-                        right = clip.samples[f * ch + 1];
+                        left = clip.samples[f * ch] * gain;
+                        right = clip.samples[f * ch + 1] * gain;
                     }
                     mixed[out_f * 2] += left;
                     mixed[out_f * 2 + 1] += right;

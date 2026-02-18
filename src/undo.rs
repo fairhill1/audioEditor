@@ -86,6 +86,12 @@ pub enum UndoAction {
         prev_sel_track: Option<usize>,
         prev_sel_clip: Option<usize>,
     },
+    AdjustGain {
+        track_idx: usize,
+        clip_idx: usize,
+        old_gain: f32,
+        new_gain: f32,
+    },
 }
 
 pub struct UndoManager {
