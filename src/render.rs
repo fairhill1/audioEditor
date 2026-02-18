@@ -239,11 +239,11 @@ impl App {
                 // Clip title bar background (spans only this clip's width)
                 let clip_x0_ndc = ((vis_start_sec - view_start) / view_duration) as f32 * 2.0 - 1.0;
                 let clip_x1_ndc = ((vis_end_sec - view_start) / view_duration) as f32 * 2.0 - 1.0;
-                // Highlight title bar for clips in the selection group
+                // Highlight title bar for clips in the selection group or multi-selection
                 let in_selection_group = self.selected_track == Some(idx)
-                    && self.selection.is_some_and(|(s0, s1)| {
+                    && (self.selection.is_some_and(|(s0, s1)| {
                         clip_start_sec < s1 && clip_end_sec > s0
-                    });
+                    }) || self.multi_selected_clips.contains(&clip_idx));
                 let title_color = if is_selected {
                     [0.25, 0.25, 0.32]
                 } else if in_selection_group {

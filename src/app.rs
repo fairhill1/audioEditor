@@ -104,6 +104,8 @@ pub(crate) struct App {
     pub(crate) selection: Option<(f64, f64)>,
     pub(crate) selecting: bool,
     pub(crate) selecting_edge: Option<SelectionEdge>,
+    /// Cmd+Click multi-selected clip indices (within `selected_track`).
+    pub(crate) multi_selected_clips: Vec<usize>,
     pub(crate) clipboard: Vec<audio::Clip>,
     pub(crate) undo_manager: undo::UndoManager,
     pub(crate) deferred_action: Option<DeferredAction>,
@@ -144,6 +146,7 @@ impl App {
             selection: None,
             selecting: false,
             selecting_edge: None,
+            multi_selected_clips: Vec::new(),
             clipboard: Vec::new(),
             undo_manager: undo::UndoManager::new(100),
             deferred_action: None,

@@ -509,8 +509,9 @@ impl ApplicationHandler for App {
                 if event.state == ElementState::Pressed
                     && event.physical_key == PhysicalKey::Code(KeyCode::Escape) =>
             {
-                if self.selection.is_some() {
+                if self.selection.is_some() || !self.multi_selected_clips.is_empty() {
                     self.selection = None;
+                    self.multi_selected_clips.clear();
                     self.selecting = false;
                     self.window.as_ref().unwrap().request_redraw();
                 }
@@ -707,27 +708,47 @@ impl ApplicationHandler for App {
                 if let Some((track_idx, clip_idx)) = self.hit_test_title_bar(self.cursor_x, self.cursor_y) {
                     // Title bar click → prepare clip drag (possibly group)
                     self.selecting = false;
+
+                    if self.modifiers.super_key() {
+                        // Cmd+Click: toggle clip in multi-selection
+                        if self.selected_track == Some(track_idx) {
+                            if let Some(pos) = self.multi_selected_clips.iter().position(|&i| i == clip_idx) {
+                                self.multi_selected_clips.remove(pos);
+                            } else {
+                                self.multi_selected_clips.push(clip_idx);
+                            }
+                            // Also include the previously single-selected clip if starting fresh
+                            if let Some(prev) = self.selected_clip {
+                                if prev != clip_idx && !self.multi_selected_clips.contains(&prev) {
+                                    self.multi_selected_clips.push(prev);
+                                }
+                            }
+                        } else {
+                            // Switching tracks — start fresh multi-select
+                            self.selected_track = Some(track_idx);
+                            self.multi_selected_clips = vec![clip_idx];
+                        }
+                        self.selected_clip = Some(clip_idx);
+                        self.selection = None;
+                        self.window.as_ref().unwrap().request_redraw();
+                        return;
+                    }
+
                     self.selected_track = Some(track_idx);
                     self.selected_clip = Some(clip_idx);
 
-                    let clip = &self.tracks[track_idx].clips[clip_idx];
-                    let clip_start = clip.offset_secs;
-                    let clip_end = clip_start + clip.duration_secs();
-
-                    // Check if clicked clip overlaps the active selection
-                    let group = if let Some((s0, s1)) = self.selection {
-                        if clip_start < s1 && clip_end > s0 {
-                            // Gather all clips overlapping the selection
-                            let indices = self.clips_overlapping_range(track_idx, s0, s1);
-                            indices.iter().map(|&i| {
-                                (i, self.tracks[track_idx].clips[i].offset_secs)
-                            }).collect::<Vec<_>>()
-                        } else {
-                            // Clicked outside selection — clear selection, single drag
-                            self.selection = None;
-                            Vec::new()
-                        }
+                    // Build drag group from multi-selection (populated by range select or Cmd+Click)
+                    let group = if self.multi_selected_clips.len() > 1
+                        && self.multi_selected_clips.contains(&clip_idx)
+                    {
+                        self.selection = None;
+                        self.multi_selected_clips.iter().map(|&i| {
+                            (i, self.tracks[track_idx].clips[i].offset_secs)
+                        }).collect::<Vec<_>>()
                     } else {
+                        // Clicked a clip not in multi-selection — single drag
+                        self.multi_selected_clips.clear();
+                        self.selection = None;
                         Vec::new()
                     };
 
@@ -735,7 +756,7 @@ impl ApplicationHandler for App {
                         // Use the leftmost group clip offset as reference
                         group.iter().map(|&(_, o)| o).fold(f64::MAX, f64::min)
                     } else {
-                        clip.offset_secs
+                        self.tracks[track_idx].clips[clip_idx].offset_secs
                     };
 
                     self.dragging = Some(DragState {
@@ -763,6 +784,7 @@ impl ApplicationHandler for App {
                     self.selecting = true;
                     self.selecting_edge = None;
                     self.dragging = None;
+                    self.multi_selected_clips.clear();
 
                     // Select track from Y position
                     if !self.tracks.is_empty() {
@@ -804,15 +826,27 @@ impl ApplicationHandler for App {
                         let px_b = (b - self.view_start) / self.effective_view_duration() * config.width as f64;
                         if (px_b - px_a).abs() < DRAG_THRESHOLD_PX {
                             self.selection = None;
+                            self.multi_selected_clips.clear();
                         } else {
                             let (start, end) = if a <= b { (a, b) } else { (b, a) };
                             self.selection = Some((start, end));
+                            // Resolve range selection into explicit clip indices
+                            if let Some(track_idx) = self.selected_track {
+                                self.multi_selected_clips = self.clips_overlapping_range(track_idx, start, end);
+                            }
                         }
                     }
                     self.window.as_ref().unwrap().request_redraw();
                 }
 
                 if let Some(drag) = self.dragging.take() {
+                    if !drag.active && !drag.group.is_empty() {
+                        // Click-without-drag on a grouped clip: collapse to single selection
+                        self.multi_selected_clips.clear();
+                        self.selected_track = Some(drag.current_track_idx);
+                        self.selected_clip = Some(drag.clip_idx);
+                        self.window.as_ref().unwrap().request_redraw();
+                    }
                     if drag.active {
                         if !drag.group.is_empty() {
                             // Group drag completion
