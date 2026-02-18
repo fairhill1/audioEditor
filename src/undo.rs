@@ -92,6 +92,11 @@ pub enum UndoAction {
         old_gain: f32,
         new_gain: f32,
     },
+    AdjustTrackGain {
+        track_idx: usize,
+        old_gain: f32,
+        new_gain: f32,
+    },
 }
 
 pub struct UndoManager {

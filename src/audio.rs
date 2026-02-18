@@ -178,6 +178,8 @@ impl Clip {
 pub struct Track {
     pub clips: Vec<Clip>,
     pub muted: bool,
+    /// Linear gain multiplier for the entire track (1.0 = unity, default)
+    pub gain: f32,
 }
 
 impl Track {

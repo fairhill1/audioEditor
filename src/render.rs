@@ -161,6 +161,11 @@ impl App {
         let view_duration = self.effective_view_duration();
         let view_end = view_start + view_duration;
 
+        // Sidebar / content area geometry
+        let sidebar_px = self.sidebar_width_px();
+        let content_px = self.content_width();
+        let content_x0_ndc = -1.0 + sidebar_px / width as f32 * 2.0;
+
         let mut vertices = Vec::new();
 
         for (idx, track) in self.tracks.iter().enumerate() {
@@ -187,16 +192,14 @@ impl App {
             let wave_center = (wave_top + wave_bot) / 2.0;
             let half_wave = (wave_top - wave_bot) / 2.0;
             let center_color = [base_color[0] * 0.5, base_color[1] * 0.5, base_color[2] * 0.5];
-            push_quad(&mut vertices, -1.0, wave_center - line_h, 1.0, wave_center + line_h, center_color);
+            push_quad(&mut vertices, content_x0_ndc, wave_center - line_h, 1.0, wave_center + line_h, center_color);
 
             // Divider line between tracks
             if idx > 0 {
-                push_quad(&mut vertices, -1.0, lane_top - line_h, 1.0, lane_top + line_h, DIVIDER_COLOR);
+                push_quad(&mut vertices, content_x0_ndc, lane_top - line_h, 1.0, lane_top + line_h, DIVIDER_COLOR);
             }
 
             // Track label background (far left column)
-            let label_w_physical = Self::TRACK_LABEL_LP * self.scale_factor();
-            let label_x1_ndc = -1.0 + label_w_physical / width as f32 * 2.0;
             let label_bg = if track.muted {
                 [0.28, 0.15, 0.15]
             } else if self.selected_track == Some(idx) {
@@ -204,7 +207,29 @@ impl App {
             } else {
                 [0.15, 0.15, 0.18]
             };
-            push_quad(&mut vertices, -1.0, lane_bot, label_x1_ndc, lane_top, label_bg);
+            push_quad(&mut vertices, -1.0, lane_bot, content_x0_ndc, lane_top, label_bg);
+
+            // Volume indicator in sidebar
+            {
+                let vol_margin_ndc = 4.0 * self.scale_factor() / width as f32 * 2.0;
+                let vol_margin_ndc_v = 4.0 * self.scale_factor() / height as f32 * 2.0;
+                // Volume bar area: full sidebar lane height
+                let vol_top = lane_top - vol_margin_ndc_v;
+                let vol_bot = lane_bot + vol_margin_ndc_v;
+                let vol_left = -1.0 + vol_margin_ndc;
+                let vol_right = content_x0_ndc - vol_margin_ndc;
+                if vol_top > vol_bot && vol_right > vol_left {
+                    // Background
+                    push_quad(&mut vertices, vol_left, vol_bot, vol_right, vol_top, [0.1, 0.1, 0.12]);
+                    // Fill
+                    let fill_h = (vol_top - vol_bot) * track.gain.clamp(0.0, 1.0);
+                    let fill_color = {
+                        let c = TRACK_COLORS[idx % TRACK_COLORS.len()];
+                        [c[0] * 0.5 * dim, c[1] * 0.5 * dim, c[2] * 0.5 * dim]
+                    };
+                    push_quad(&mut vertices, vol_left, vol_bot, vol_right, vol_bot + fill_h, fill_color);
+                }
+            }
 
             // Selection highlight (behind waveforms, only on selected track)
             if self.selected_track == Some(idx) {
@@ -212,9 +237,10 @@ impl App {
                     let (s0, s1) = if sel_start <= sel_end { (sel_start, sel_end) } else { (sel_end, sel_start) };
                     let x0_frac = ((s0 - view_start) / view_duration) as f32;
                     let x1_frac = ((s1 - view_start) / view_duration) as f32;
+                    let content_ndc_w = 1.0 - content_x0_ndc;
                     if x1_frac > 0.0 && x0_frac < 1.0 {
-                        let x0 = x0_frac.max(0.0) * 2.0 - 1.0;
-                        let x1 = x1_frac.min(1.0) * 2.0 - 1.0;
+                        let x0 = content_x0_ndc + x0_frac.max(0.0) * content_ndc_w;
+                        let x1 = content_x0_ndc + x1_frac.min(1.0) * content_ndc_w;
                         push_quad(&mut vertices, x0, wave_bot, x1, wave_top, [0.15, 0.20, 0.35]);
                     }
                 }
@@ -237,8 +263,9 @@ impl App {
                 }
 
                 // Clip title bar background (spans only this clip's width)
-                let clip_x0_ndc = ((vis_start_sec - view_start) / view_duration) as f32 * 2.0 - 1.0;
-                let clip_x1_ndc = ((vis_end_sec - view_start) / view_duration) as f32 * 2.0 - 1.0;
+                let content_ndc_w = 1.0 - content_x0_ndc;
+                let clip_x0_ndc = content_x0_ndc + ((vis_start_sec - view_start) / view_duration) as f32 * content_ndc_w;
+                let clip_x1_ndc = content_x0_ndc + ((vis_end_sec - view_start) / view_duration) as f32 * content_ndc_w;
                 // Highlight title bar for clips in the selection group or multi-selection
                 let in_selection_group = self.selected_track == Some(idx)
                     && (self.selection.is_some_and(|(s0, s1)| {
@@ -271,14 +298,15 @@ impl App {
 
                 // How many pixel columns does this clip's visible portion span?
                 let vis_frac = (vis_end_sec - vis_start_sec) / view_duration;
-                let clip_cols = (width as f64 * vis_frac) as u32;
+                let clip_cols = (content_px as f64 * vis_frac) as u32;
                 if clip_cols == 0 {
                     continue;
                 }
                 let samples_per_col = (vis_sample_count as f64 / clip_cols as f64).max(1.0);
 
-                // Where does the visible portion start in NDC x?
-                let x_offset = ((vis_start_sec - view_start) / view_duration) as f32;
+                // Where does the visible portion start in pixel x (within content area)?
+                let x_offset_px = sidebar_px + ((vis_start_sec - view_start) / view_duration) as f32 * content_px;
+                let effective_gain = clip.gain * track.gain;
 
                 for col in 0..clip_cols {
                     let start = vis_start_sample + (col as f64 * samples_per_col) as usize;
@@ -289,11 +317,11 @@ impl App {
                     }
 
                     let (min_val, max_val) = clip.min_max_range(start, end);
-                    let min_val = min_val * clip.gain;
-                    let max_val = max_val * clip.gain;
+                    let min_val = min_val * effective_gain;
+                    let max_val = max_val * effective_gain;
 
-                    let x0 = (x_offset + col as f32 / width as f32) * 2.0 - 1.0;
-                    let x1 = (x_offset + (col + 1) as f32 / width as f32) * 2.0 - 1.0;
+                    let x0 = (x_offset_px + col as f32) / width as f32 * 2.0 - 1.0;
+                    let x1 = (x_offset_px + (col + 1) as f32) / width as f32 * 2.0 - 1.0;
 
                     let y_top = (wave_center + max_val * half_wave).min(wave_top);
                     let y_bot = (wave_center + min_val * half_wave).max(wave_bot);
@@ -308,18 +336,19 @@ impl App {
         if max_dur > 0.0 {
             let scrollbar_h = Self::SCROLLBAR_LP * self.scale_factor();
             let bar_ndc_h = scrollbar_h / height as f32 * 2.0;
+            let content_ndc_w = 1.0 - content_x0_ndc;
 
-            // Track background (full width, dark)
+            // Track background (content width, dark)
             let track_bg = [0.15, 0.15, 0.18];
             let bar_top = -1.0 + bar_ndc_h;
             let bar_bot = -1.0_f32;
-            push_quad(&mut vertices, -1.0, bar_bot, 1.0, bar_top, track_bg);
+            push_quad(&mut vertices, content_x0_ndc, bar_bot, 1.0, bar_top, track_bg);
 
             // Thumb (shows visible portion)
             let thumb_left = (view_start / max_dur) as f32;
             let thumb_right = ((view_start + view_duration) / max_dur) as f32;
-            let thumb_x0 = thumb_left * 2.0 - 1.0;
-            let thumb_x1 = thumb_right * 2.0 - 1.0;
+            let thumb_x0 = content_x0_ndc + thumb_left * content_ndc_w;
+            let thumb_x1 = content_x0_ndc + thumb_right * content_ndc_w;
             let thumb_color = [0.4, 0.4, 0.45];
             push_quad(&mut vertices, thumb_x0, bar_bot, thumb_x1, bar_top, thumb_color);
         }
@@ -329,8 +358,9 @@ impl App {
             let max_dur = self.max_duration();
             let playhead_secs = player.position_frac() * max_dur;
             let ndc_frac = ((playhead_secs - view_start) / view_duration) as f32;
+            let content_ndc_w = 1.0 - content_x0_ndc;
             if ndc_frac >= 0.0 && ndc_frac <= 1.0 {
-                let x = ndc_frac * 2.0 - 1.0;
+                let x = content_x0_ndc + ndc_frac * content_ndc_w;
                 let hw = 1.0 / width as f32;
                 push_quad(&mut vertices, x - hw, -1.0, x + hw, 1.0, [1.0, 1.0, 1.0]);
             }
@@ -392,9 +422,11 @@ impl App {
         let view_duration = self.effective_view_duration();
         let view_end = view_start + view_duration;
 
-        let font_system = self.font_system.as_mut().unwrap();
-
         // Per-clip title text buffers
+        let sidebar_px = self.sidebar_width_px();
+        let content_px = self.content_width();
+
+        let font_system = self.font_system.as_mut().unwrap();
         if !self.tracks.is_empty() {
             for (track_idx, track) in self.tracks.iter().enumerate() {
                 for clip in &track.clips {
@@ -405,8 +437,8 @@ impl App {
                     if vis_start >= vis_end {
                         continue;
                     }
-                    let clip_left_px = ((vis_start - view_start) / view_duration) as f32 * width as f32;
-                    let clip_right_px = ((vis_end - view_start) / view_duration) as f32 * width as f32;
+                    let clip_left_px = sidebar_px + ((vis_start - view_start) / view_duration) as f32 * content_px;
+                    let clip_right_px = sidebar_px + ((vis_end - view_start) / view_duration) as f32 * content_px;
                     let clip_width_px = clip_right_px - clip_left_px;
 
                     let display_name = if (clip.gain - 1.0).abs() > 1e-4 {
@@ -434,6 +466,22 @@ impl App {
                 let label = format!("T{}", idx + 1);
                 let mut buffer = Buffer::new(font_system, Metrics::new(font_size_phys, line_height_phys));
                 buffer.set_size(font_system, Some(label_w_phys), Some(line_height_phys * 2.0));
+                buffer.set_text(font_system, &label, &Attrs::new().family(Family::SansSerif).weight(glyphon::Weight::BOLD), Shaping::Advanced, None);
+                buffer.shape_until_scroll(font_system, false);
+                text_buffers.push(buffer);
+            }
+        }
+
+        // Volume percentage text buffers
+        let vol_pct_start_idx = text_buffers.len();
+        let vol_font_size = Self::FONT_SIZE_LP * scale * 0.75;
+        let vol_line_h = Self::LINE_HEIGHT_LP * scale * 0.75;
+        if !self.tracks.is_empty() {
+            for track in &self.tracks {
+                let pct = (track.gain.clamp(0.0, 1.0) * 100.0).round() as u32;
+                let label = format!("{}%", pct);
+                let mut buffer = Buffer::new(font_system, Metrics::new(vol_font_size, vol_line_h));
+                buffer.set_size(font_system, Some(label_w_phys), Some(vol_line_h * 2.0));
                 buffer.set_text(font_system, &label, &Attrs::new().family(Family::SansSerif), Shaping::Advanced, None);
                 buffer.shape_until_scroll(font_system, false);
                 text_buffers.push(buffer);
@@ -505,27 +553,54 @@ impl App {
                 });
             }
 
-            // Track label text areas
+            // Track label + volume percentage text areas
+            let vol_line_h = Self::LINE_HEIGHT_LP * scale * 0.75;
             for idx in 0..num_tracks {
-                let buf_idx = track_label_start_idx + idx;
                 let lane_top_px = idx as f32 * lane_height_px;
-                let vert_center = lane_top_px + lane_height_px / 2.0 - line_height_phys / 2.0;
+                let lane_bot_px = (idx + 1) as f32 * lane_height_px;
+                // Both labels stacked vertically, centered as a group
+                let total_h = line_height_phys + vol_line_h;
+                let group_top = lane_top_px + (lane_height_px - total_h) / 2.0;
+
+                // Track label (T1, T2, ...)
+                let label_buf_idx = track_label_start_idx + idx;
+                let label_w = text_buffers[label_buf_idx].layout_runs().next().map(|r| r.line_w).unwrap_or(0.0);
+                let label_left = (sidebar_px - label_w) / 2.0;
                 text_areas.push(TextArea {
-                    buffer: &text_buffers[buf_idx],
-                    left: padding_phys * 0.5,
-                    top: vert_center,
+                    buffer: &text_buffers[label_buf_idx],
+                    left: label_left.max(0.0),
+                    top: group_top,
                     scale: 1.0,
                     bounds: TextBounds {
                         left: 0,
                         top: lane_top_px as i32,
-                        right: label_w_phys as i32,
-                        bottom: (lane_top_px + lane_height_px) as i32,
+                        right: sidebar_px as i32,
+                        bottom: lane_bot_px as i32,
                     },
                     default_color: if self.tracks[idx].muted {
                         GlyphonColor::rgb(200, 100, 100)
                     } else {
-                        GlyphonColor::rgb(160, 160, 170)
+                        GlyphonColor::rgb(255, 255, 255)
                     },
+                    custom_glyphs: &[],
+                });
+
+                // Volume percentage below
+                let vol_buf_idx = vol_pct_start_idx + idx;
+                let vol_w = text_buffers[vol_buf_idx].layout_runs().next().map(|r| r.line_w).unwrap_or(0.0);
+                let vol_left = (sidebar_px - vol_w) / 2.0;
+                text_areas.push(TextArea {
+                    buffer: &text_buffers[vol_buf_idx],
+                    left: vol_left.max(0.0),
+                    top: group_top + line_height_phys,
+                    scale: 1.0,
+                    bounds: TextBounds {
+                        left: 0,
+                        top: lane_top_px as i32,
+                        right: sidebar_px as i32,
+                        bottom: lane_bot_px as i32,
+                    },
+                    default_color: GlyphonColor::rgb(220, 220, 220),
                     custom_glyphs: &[],
                 });
             }

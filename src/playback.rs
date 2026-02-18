@@ -53,7 +53,7 @@ impl Player {
                 let frames = clip.samples.len() / ch;
                 let offset_frames = (clip.offset_secs * sample_rate as f64) as usize;
 
-                let gain = clip.gain;
+                let gain = clip.gain * track.gain;
                 for f in 0..frames {
                     let out_f = offset_frames + f;
                     if out_f >= max_frames as usize {

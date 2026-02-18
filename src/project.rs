@@ -19,6 +19,12 @@ pub struct TrackEntry {
     pub clips: Vec<ClipEntry>,
     #[serde(default)]
     pub muted: bool,
+    #[serde(default = "default_gain")]
+    pub gain: f32,
+}
+
+fn default_gain() -> f32 {
+    1.0
 }
 
 #[derive(Serialize, Deserialize)]
@@ -82,7 +88,7 @@ pub fn save_project(
             });
         }
 
-        track_entries.push(TrackEntry { clips: clip_entries, muted: track.muted });
+        track_entries.push(TrackEntry { clips: clip_entries, muted: track.muted, gain: track.gain });
     }
 
     let project = ProjectFile {
@@ -140,7 +146,7 @@ pub fn load_project(ron_path: &Path) -> Result<(Vec<audio::Track>, u32), Box<dyn
             });
         }
 
-        tracks.push(audio::Track { clips, muted: track_entry.muted });
+        tracks.push(audio::Track { clips, muted: track_entry.muted, gain: track_entry.gain });
     }
 
     Ok((tracks, project.rate))

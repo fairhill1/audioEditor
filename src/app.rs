@@ -107,6 +107,7 @@ pub(crate) struct App {
     /// Cmd+Click multi-selected clip indices (within `selected_track`).
     pub(crate) multi_selected_clips: Vec<usize>,
     pub(crate) clipboard: Vec<audio::Clip>,
+    pub(crate) dragging_track_gain: Option<(usize, f32)>,
     pub(crate) undo_manager: undo::UndoManager,
     pub(crate) deferred_action: Option<DeferredAction>,
     pub(crate) pending_dialog: Option<PendingDialog>,
@@ -148,6 +149,7 @@ impl App {
             selecting_edge: None,
             multi_selected_clips: Vec::new(),
             clipboard: Vec::new(),
+            dragging_track_gain: None,
             undo_manager: undo::UndoManager::new(100),
             deferred_action: None,
             pending_dialog: None,
@@ -173,6 +175,16 @@ impl App {
 
     pub(crate) fn scale_factor(&self) -> f32 {
         self.window.as_ref().map_or(1.0, |w| w.scale_factor() as f32)
+    }
+
+    /// Width of the sidebar in physical pixels
+    pub(crate) fn sidebar_width_px(&self) -> f32 {
+        Self::TRACK_LABEL_LP * self.scale_factor()
+    }
+
+    /// Width of the content area (timeline) in physical pixels
+    pub(crate) fn content_width(&self) -> f32 {
+        self.config.as_ref().map_or(0.0, |c| c.width as f32) - self.sidebar_width_px()
     }
 
     pub(crate) fn max_duration(&self) -> f64 {

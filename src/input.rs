@@ -396,7 +396,7 @@ impl ApplicationHandler for App {
                 let prev_sel_track = self.selected_track;
                 let prev_sel_clip = self.selected_clip;
                 let insert_at = self.selected_track.map_or(self.tracks.len(), |i| i + 1);
-                self.tracks.insert(insert_at, audio::Track { clips: vec![], muted: false });
+                self.tracks.insert(insert_at, audio::Track { clips: vec![], muted: false, gain: 1.0 });
                 self.undo_manager.push(undo::UndoAction::CreateTrack {
                     track_idx: insert_at, prev_sel_track, prev_sel_clip,
                 });
@@ -630,6 +630,19 @@ impl ApplicationHandler for App {
                     self.window.as_ref().unwrap().request_redraw();
                 }
 
+                // Handle track gain dragging
+                if let Some((track_idx, _old_gain)) = self.dragging_track_gain {
+                    if let Some(config) = &self.config {
+                        let num_tracks = self.tracks.len();
+                        let lane_height = config.height as f64 / num_tracks as f64;
+                        let lane_top = track_idx as f64 * lane_height;
+                        let lane_bot = (track_idx + 1) as f64 * lane_height;
+                        let gain = 1.0 - ((position.y - lane_top) / (lane_bot - lane_top));
+                        self.tracks[track_idx].gain = (gain as f32).clamp(0.0, 1.0);
+                        self.window.as_ref().unwrap().request_redraw();
+                    }
+                }
+
                 // Handle clip dragging
                 if let Some(drag) = &mut self.dragging {
                     if !drag.active {
@@ -643,8 +656,12 @@ impl ApplicationHandler for App {
                 }
 
                 // Update cursor icon
-                if self.dragging.as_ref().is_some_and(|d| d.active) {
+                if self.dragging_track_gain.is_some() {
+                    self.window.as_ref().unwrap().set_cursor(CursorIcon::NsResize);
+                } else if self.dragging.as_ref().is_some_and(|d| d.active) {
                     self.window.as_ref().unwrap().set_cursor(CursorIcon::Grabbing);
+                } else if (position.x as f32) < self.sidebar_width_px() && !self.tracks.is_empty() {
+                    self.window.as_ref().unwrap().set_cursor(CursorIcon::NsResize);
                 } else if self.hit_test_title_bar(position.x, position.y).is_some() {
                     self.window.as_ref().unwrap().set_cursor(CursorIcon::Grab);
                 } else if self.hit_test_selection_edge(position.x).is_some() {
@@ -657,9 +674,10 @@ impl ApplicationHandler for App {
                     let config = self.config.as_ref().unwrap();
                     let view_duration = self.effective_view_duration();
                     let num_tracks = self.tracks.len();
+                    let content_w = self.content_width() as f64;
 
                     let dx_px = position.x - self.dragging.as_ref().unwrap().start_x;
-                    let dx_secs = dx_px / config.width as f64 * view_duration;
+                    let dx_secs = dx_px / content_w * view_duration;
                     let desired_offset = (self.dragging.as_ref().unwrap().start_offset + dx_secs).max(0.0);
 
                     let is_group = !self.dragging.as_ref().unwrap().group.is_empty();
@@ -745,7 +763,26 @@ impl ApplicationHandler for App {
                 button: winit::event::MouseButton::Left,
                 ..
             } => {
-                if let Some((track_idx, clip_idx)) = self.hit_test_title_bar(self.cursor_x, self.cursor_y) {
+                // Sidebar click → start track gain drag
+                let sidebar = self.sidebar_width_px() as f64;
+                if self.cursor_x < sidebar && !self.tracks.is_empty() {
+                    if let Some(config) = &self.config {
+                        let num_tracks = self.tracks.len();
+                        let lane_height = config.height as f64 / num_tracks as f64;
+                        let track_idx = (self.cursor_y / lane_height) as usize;
+                        if track_idx < num_tracks {
+                            let old_gain = self.tracks[track_idx].gain;
+                            self.selected_track = Some(track_idx);
+                            self.dragging_track_gain = Some((track_idx, old_gain));
+                            // Immediately update gain from Y position
+                            let lane_top = track_idx as f64 * lane_height;
+                            let lane_bot = (track_idx + 1) as f64 * lane_height;
+                            let gain = 1.0 - ((self.cursor_y - lane_top) / (lane_bot - lane_top));
+                            self.tracks[track_idx].gain = (gain as f32).clamp(0.0, 1.0);
+                            self.window.as_ref().unwrap().request_redraw();
+                        }
+                    }
+                } else if let Some((track_idx, clip_idx)) = self.hit_test_title_bar(self.cursor_x, self.cursor_y) {
                     // Title bar click → prepare clip drag (possibly group)
                     self.selecting = false;
 
@@ -876,6 +913,19 @@ impl ApplicationHandler for App {
                 button: winit::event::MouseButton::Left,
                 ..
             } => {
+                // Finalize track gain drag
+                if let Some((track_idx, old_gain)) = self.dragging_track_gain.take() {
+                    let new_gain = self.tracks[track_idx].gain;
+                    if (new_gain - old_gain).abs() > 1e-6 {
+                        self.undo_manager.push(undo::UndoAction::AdjustTrackGain {
+                            track_idx, old_gain, new_gain,
+                        });
+                        self.rebuild_player();
+                        self.update_title();
+                    }
+                    self.window.as_ref().unwrap().request_redraw();
+                }
+
                 // Finalize selection
                 if self.selecting {
                     self.selecting = false;
@@ -989,7 +1039,7 @@ impl ApplicationHandler for App {
                     // Horizontal scroll amount as fraction of view
                     let scroll = if dx.abs() > 0.0 { -dx } else if self.modifiers.shift_key() { -dy } else { 0.0 };
                     if scroll != 0.0 {
-                        let shift = scroll / self.config.as_ref().map_or(1.0, |c| c.width as f64) * view_dur;
+                        let shift = scroll / self.content_width().max(1.0) as f64 * view_dur;
                         self.view_start = (self.view_start + shift).clamp(0.0, (max_dur - view_dur).max(0.0));
                         self.window.as_ref().unwrap().request_redraw();
                     }
@@ -1010,7 +1060,9 @@ impl ApplicationHandler for App {
                     let new_dur = (view_dur / zoom_factor).clamp(0.01, max_dur);
 
                     // Zoom toward cursor
-                    let cursor_frac = self.cursor_x / self.config.as_ref().map_or(1.0, |c| c.width as f64);
+                    let sidebar = self.sidebar_width_px() as f64;
+                    let content_w = self.content_width().max(1.0) as f64;
+                    let cursor_frac = ((self.cursor_x - sidebar) / content_w).clamp(0.0, 1.0);
                     let time_at_cursor = self.view_start + cursor_frac * view_dur;
                     self.view_duration = new_dur;
                     self.view_start = (time_at_cursor - cursor_frac * new_dur).clamp(0.0, (max_dur - new_dur).max(0.0));
@@ -1026,7 +1078,9 @@ impl ApplicationHandler for App {
                     let zoom_factor = 1.0 + delta;
                     let new_dur = (view_dur / zoom_factor).clamp(0.01, max_dur);
 
-                    let cursor_frac = self.cursor_x / self.config.as_ref().map_or(1.0, |c| c.width as f64);
+                    let sidebar = self.sidebar_width_px() as f64;
+                    let content_w = self.content_width().max(1.0) as f64;
+                    let cursor_frac = ((self.cursor_x - sidebar) / content_w).clamp(0.0, 1.0);
                     let time_at_cursor = self.view_start + cursor_frac * view_dur;
                     self.view_duration = new_dur;
                     self.view_start = (time_at_cursor - cursor_frac * new_dur).clamp(0.0, (max_dur - new_dur).max(0.0));

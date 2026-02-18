@@ -51,7 +51,7 @@ impl App {
                 let cur_sel_track = self.selected_track;
                 let cur_sel_clip = self.selected_clip;
                 if track_was_removed {
-                    self.tracks.insert(track_idx, audio::Track { clips: vec![], muted: false });
+                    self.tracks.insert(track_idx, audio::Track { clips: vec![], muted: false, gain: 1.0 });
                 }
                 self.tracks[track_idx].clips.insert(clip_idx, clip.clone());
                 self.selected_track = prev_sel_track;
@@ -142,7 +142,7 @@ impl App {
 
                     if src_track_was_removed {
                         // Re-insert the source track
-                        self.tracks.insert(src_track, audio::Track { clips: vec![clip], muted: false });
+                        self.tracks.insert(src_track, audio::Track { clips: vec![clip], muted: false, gain: 1.0 });
                     } else {
                         let insert_at = src_clip_idx.min(self.tracks[src_track].clips.len());
                         self.tracks[src_track].clips.insert(insert_at, clip);
@@ -334,6 +334,16 @@ impl App {
                     new_gain: old_gain,
                 }
             }
+            undo::UndoAction::AdjustTrackGain {
+                track_idx, old_gain, new_gain,
+            } => {
+                self.tracks[track_idx].gain = old_gain;
+                undo::UndoAction::AdjustTrackGain {
+                    track_idx,
+                    old_gain: new_gain,
+                    new_gain: old_gain,
+                }
+            }
         }
     }
 
@@ -467,6 +477,7 @@ impl App {
                     self.tracks.push(audio::Track {
                         clips: vec![clip],
                         muted: false,
+                        gain: 1.0,
                     });
                     let track_idx = self.tracks.len() - 1;
                     self.undo_manager.push(undo::UndoAction::ImportClip {
@@ -524,7 +535,7 @@ impl App {
                 let clip_frames = clip.mono.len(); // mono.len() == number of frames
                 let clip_ch = clip.channels as usize;
 
-                let gain = clip.gain;
+                let gain = clip.gain * track.gain;
                 for f in 0..clip_frames {
                     let out_f = frame_offset + f;
                     if out_f >= total_frames {
@@ -577,6 +588,7 @@ impl App {
                 self.tracks.push(audio::Track {
                     clips: vec![clip],
                     muted: false,
+                    gain: 1.0,
                 });
                 let track_idx = self.tracks.len() - 1;
                 self.undo_manager.push(undo::UndoAction::GenerateClickTrack {

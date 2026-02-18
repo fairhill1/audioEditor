@@ -7,6 +7,10 @@ impl App {
         if self.tracks.is_empty() {
             return None;
         }
+        let sidebar = self.sidebar_width_px() as f64;
+        if px < sidebar {
+            return None;
+        }
         let config = self.config.as_ref()?;
         let num_tracks = self.tracks.len();
         let lane_height_px = config.height as f64 / num_tracks as f64;
@@ -15,9 +19,7 @@ impl App {
             return None;
         }
 
-        let view_start = self.view_start;
-        let view_duration = self.effective_view_duration();
-        let cursor_secs = view_start + (px / config.width as f64) * view_duration;
+        let cursor_secs = self.px_to_secs(px);
 
         let track = &self.tracks[track_idx];
         for (clip_idx, clip) in track.clips.iter().enumerate() {
@@ -35,6 +37,10 @@ impl App {
         if self.tracks.is_empty() {
             return None;
         }
+        let sidebar = self.sidebar_width_px() as f64;
+        if px < sidebar {
+            return None;
+        }
         let config = self.config.as_ref()?;
         let num_tracks = self.tracks.len();
         let lane_height_px = config.height as f64 / num_tracks as f64;
@@ -49,9 +55,7 @@ impl App {
             return None;
         }
 
-        let view_start = self.view_start;
-        let view_duration = self.effective_view_duration();
-        let cursor_secs = view_start + (px / config.width as f64) * view_duration;
+        let cursor_secs = self.px_to_secs(px);
 
         let track = &self.tracks[track_idx];
         for (clip_idx, clip) in track.clips.iter().enumerate() {
@@ -66,14 +70,19 @@ impl App {
 
     /// Convert a pixel X position to seconds on the timeline
     pub(crate) fn px_to_secs(&self, px: f64) -> f64 {
-        let config = self.config.as_ref().unwrap();
-        self.view_start + (px / config.width as f64) * self.effective_view_duration()
+        let sidebar = self.sidebar_width_px() as f64;
+        let content_w = self.content_width() as f64;
+        if px < sidebar || content_w <= 0.0 {
+            return self.view_start;
+        }
+        self.view_start + ((px - sidebar) / content_w) * self.effective_view_duration()
     }
 
     /// Convert seconds to pixel X position
     pub(crate) fn secs_to_px(&self, secs: f64) -> f64 {
-        let config = self.config.as_ref().unwrap();
-        (secs - self.view_start) / self.effective_view_duration() * config.width as f64
+        let sidebar = self.sidebar_width_px() as f64;
+        let content_w = self.content_width() as f64;
+        (secs - self.view_start) / self.effective_view_duration() * content_w + sidebar
     }
 
     /// Check if a pixel X is near a selection edge, returning which edge
