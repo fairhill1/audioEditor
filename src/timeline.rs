@@ -396,4 +396,40 @@ impl App {
             })
             .unwrap_or(desired.max(0.0))
     }
+
+    /// Snap a time value to the nearest clip edge (start or end) in a track.
+    /// Returns the snapped value if within threshold, otherwise the original.
+    pub(crate) fn snap_to_clip_edges(&self, track_idx: usize, secs: f64) -> f64 {
+        let config = match self.config.as_ref() {
+            Some(c) => c,
+            None => return secs,
+        };
+        if track_idx >= self.tracks.len() {
+            return secs;
+        }
+        let view_duration = self.effective_view_duration();
+        let snap_secs = 10.0 / config.width as f64 * view_duration;
+
+        let mut best = secs;
+        let mut best_dist = f64::MAX;
+
+        for clip in &self.tracks[track_idx].clips {
+            let start = clip.offset_secs;
+            let end = clip.offset_secs + clip.duration_secs();
+
+            let d = (secs - start).abs();
+            if d < snap_secs && d < best_dist {
+                best_dist = d;
+                best = start;
+            }
+
+            let d = (secs - end).abs();
+            if d < snap_secs && d < best_dist {
+                best_dist = d;
+                best = end;
+            }
+        }
+
+        best
+    }
 }

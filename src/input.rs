@@ -682,7 +682,17 @@ impl ApplicationHandler for App {
 
                 // Update selection while dragging
                 if self.selecting {
-                    let secs = self.px_to_secs(position.x);
+                    let raw_secs = self.px_to_secs(position.x);
+                    let secs = if let Some(track_idx) = self.selected_track {
+                        self.snap_to_clip_edges(track_idx, raw_secs)
+                    } else {
+                        raw_secs
+                    };
+                    self.snap_line_secs = if (secs - raw_secs).abs() > 1e-9 {
+                        Some(secs)
+                    } else {
+                        None
+                    };
                     if let Some(sel) = &mut self.selection {
                         match self.selecting_edge {
                             Some(SelectionEdge::Left) => sel.0 = secs,
@@ -731,6 +741,31 @@ impl ApplicationHandler for App {
                     self.window.as_ref().unwrap().set_cursor(CursorIcon::EwResize);
                 } else {
                     self.window.as_ref().unwrap().set_cursor(CursorIcon::Text);
+                }
+
+                // Show snap indicator on hover (when not selecting or dragging)
+                if !self.selecting && self.dragging.as_ref().map_or(true, |d| !d.active) {
+                    let raw_secs = self.px_to_secs(position.x);
+                    let track_idx = if !self.tracks.is_empty() {
+                        if let Some(config) = &self.config {
+                            let idx = (position.y / config.height as f64 * self.tracks.len() as f64) as usize;
+                            Some(idx.min(self.tracks.len() - 1))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    let old = self.snap_line_secs;
+                    self.snap_line_secs = if let Some(ti) = track_idx {
+                        let snapped = self.snap_to_clip_edges(ti, raw_secs);
+                        if (snapped - raw_secs).abs() > 1e-9 { Some(snapped) } else { None }
+                    } else {
+                        None
+                    };
+                    if self.snap_line_secs != old {
+                        self.window.as_ref().unwrap().request_redraw();
+                    }
                 }
 
                 if self.dragging.as_ref().is_some_and(|d| d.active) {
@@ -939,24 +974,38 @@ impl ApplicationHandler for App {
                     self.dragging = None;
                 } else {
                     // Click on waveform body or empty area → start selection
-                    let click_secs = self.px_to_secs(self.cursor_x);
-                    self.selection = Some((click_secs, click_secs));
+                    let raw_secs = self.px_to_secs(self.cursor_x);
                     self.selecting = true;
                     self.selecting_edge = None;
                     self.dragging = None;
                     self.multi_selected_clips.clear();
 
-                    // Select track from Y position
+                    // Select track from Y position (need track before snapping)
                     if !self.tracks.is_empty() {
                         if let Some(config) = &self.config {
                             let track_idx = (self.cursor_y / config.height as f64 * self.tracks.len() as f64) as usize;
                             self.selected_track = Some(track_idx.min(self.tracks.len() - 1));
                         }
                     }
-                    // Select clip if clicking on one (but not via title bar)
-                    if let Some((track_idx, clip_idx)) = self.hit_test_clip(self.cursor_x, self.cursor_y) {
-                        self.selected_track = Some(track_idx);
-                        self.selected_clip = Some(clip_idx);
+                    // Snap start point to clip edges
+                    let click_secs = if let Some(track_idx) = self.selected_track {
+                        self.snap_to_clip_edges(track_idx, raw_secs)
+                    } else {
+                        raw_secs
+                    };
+                    self.selection = Some((click_secs, click_secs));
+
+                    // Select clip if clicking on one (but not via title bar).
+                    // Skip if click snapped to a clip edge — user is starting a
+                    // selection, not picking a clip.
+                    let snapped = (click_secs - raw_secs).abs() > 1e-9;
+                    if !snapped {
+                        if let Some((track_idx, clip_idx)) = self.hit_test_clip(self.cursor_x, self.cursor_y) {
+                            self.selected_track = Some(track_idx);
+                            self.selected_clip = Some(clip_idx);
+                        } else {
+                            self.selected_clip = None;
+                        }
                     } else {
                         self.selected_clip = None;
                     }
@@ -993,6 +1042,7 @@ impl ApplicationHandler for App {
                 if self.selecting {
                     self.selecting = false;
                     self.selecting_edge = None;
+                    self.snap_line_secs = None;
                     // Use pixel distance to decide if it was a real drag or just a click
                     if let (Some((a, b)), Some(config)) = (self.selection, self.config.as_ref()) {
                         let px_a = (a - self.view_start) / self.effective_view_duration() * config.width as f64;
@@ -1003,6 +1053,7 @@ impl ApplicationHandler for App {
                         } else {
                             let (start, end) = if a <= b { (a, b) } else { (b, a) };
                             self.selection = Some((start, end));
+                            self.selected_clip = None;
                             // Resolve range selection into explicit clip indices
                             if let Some(track_idx) = self.selected_track {
                                 self.multi_selected_clips = self.clips_overlapping_range(track_idx, start, end);

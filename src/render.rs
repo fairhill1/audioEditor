@@ -366,6 +366,17 @@ impl App {
             }
         }
 
+        // Snap indicator (green line during selection drag)
+        if let Some(snap_secs) = self.snap_line_secs {
+            let ndc_frac = ((snap_secs - view_start) / view_duration) as f32;
+            let content_ndc_w = 1.0 - content_x0_ndc;
+            if ndc_frac >= 0.0 && ndc_frac <= 1.0 {
+                let x = content_x0_ndc + ndc_frac * content_ndc_w;
+                let hw = 1.0 / width as f32;
+                push_quad(&mut vertices, x - hw, -1.0, x + hw, 1.0, [0.0, 0.8, 0.2]);
+            }
+        }
+
         // Modal overlay
         if self.modal.is_some() {
             // Modal box (centered, fixed NDC size)

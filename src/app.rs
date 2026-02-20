@@ -104,6 +104,8 @@ pub(crate) struct App {
     pub(crate) selection: Option<(f64, f64)>,
     pub(crate) selecting: bool,
     pub(crate) selecting_edge: Option<SelectionEdge>,
+    /// Active snap indicator position (shown as green line during selection drag).
+    pub(crate) snap_line_secs: Option<f64>,
     /// Cmd+Click multi-selected clip indices (within `selected_track`).
     pub(crate) multi_selected_clips: Vec<usize>,
     pub(crate) clipboard: Vec<audio::Clip>,
@@ -146,6 +148,7 @@ impl App {
             dragging: None,
             selection: None,
             selecting: false,
+            snap_line_secs: None,
             selecting_edge: None,
             multi_selected_clips: Vec::new(),
             clipboard: Vec::new(),
