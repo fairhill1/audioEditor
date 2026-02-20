@@ -413,7 +413,7 @@ impl ApplicationHandler for App {
                 if !self.clipboard.is_empty() {
                     if let Some(track_idx) = self.selected_track {
                         if track_idx < self.tracks.len() {
-                            let playhead = self.playhead_secs();
+                            let playhead = self.snap_to_clip_edges(track_idx, self.playhead_secs());
                             // Build new clips with offsets relative to playhead
                             let new_clips: Vec<audio::Clip> = self.clipboard.iter().map(|c| {
                                 let mut nc = c.clone();
