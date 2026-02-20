@@ -273,6 +273,25 @@ impl ApplicationHandler for App {
                             self.clipboard = copied;
                         }
                     }
+                } else if !self.multi_selected_clips.is_empty() {
+                    if let Some(track_idx) = self.selected_track {
+                        if track_idx < self.tracks.len() {
+                            let clips = &self.tracks[track_idx].clips;
+                            let mut copied: Vec<_> = self.multi_selected_clips.iter()
+                                .filter(|&&i| i < clips.len())
+                                .map(|&i| clips[i].clone())
+                                .collect();
+                            if !copied.is_empty() {
+                                let min_offset = copied.iter()
+                                    .map(|c| c.offset_secs)
+                                    .fold(f64::INFINITY, f64::min);
+                                for c in &mut copied {
+                                    c.offset_secs -= min_offset;
+                                }
+                                self.clipboard = copied;
+                            }
+                        }
+                    }
                 } else if let (Some(track_idx), Some(clip_idx)) = (self.selected_track, self.selected_clip) {
                     if track_idx < self.tracks.len() && clip_idx < self.tracks[track_idx].clips.len() {
                         let mut c = self.tracks[track_idx].clips[clip_idx].clone();
@@ -317,6 +336,50 @@ impl ApplicationHandler for App {
                             }
                             self.rebuild_player();
                             self.window.as_ref().unwrap().request_redraw();
+                        }
+                    }
+                } else if !self.multi_selected_clips.is_empty() {
+                    if let Some(track_idx) = self.selected_track {
+                        if track_idx < self.tracks.len() {
+                            let prev_clipboard = self.clipboard.clone();
+                            let prev_sel_clip = self.selected_clip;
+                            let prev_clips = self.tracks[track_idx].clips.clone();
+
+                            let clips = &self.tracks[track_idx].clips;
+                            let mut copied: Vec<_> = self.multi_selected_clips.iter()
+                                .filter(|&&i| i < clips.len())
+                                .map(|&i| clips[i].clone())
+                                .collect();
+                            if !copied.is_empty() {
+                                let min_offset = copied.iter()
+                                    .map(|c| c.offset_secs)
+                                    .fold(f64::INFINITY, f64::min);
+                                for c in &mut copied {
+                                    c.offset_secs -= min_offset;
+                                }
+                                // Remove clips in reverse index order to preserve indices
+                                let mut indices: Vec<usize> = self.multi_selected_clips.clone();
+                                indices.sort_unstable();
+                                indices.dedup();
+                                for &i in indices.iter().rev() {
+                                    if i < self.tracks[track_idx].clips.len() {
+                                        self.tracks[track_idx].clips.remove(i);
+                                    }
+                                }
+                                self.undo_manager.push(undo::UndoAction::CutRegion {
+                                    track_idx, prev_clips, prev_clipboard,
+                                    prev_sel_clip, prev_selection: self.selection,
+                                });
+                                self.clipboard = copied;
+                                self.multi_selected_clips.clear();
+                                if self.tracks[track_idx].clips.is_empty() {
+                                    self.selected_clip = None;
+                                } else {
+                                    self.selected_clip = Some(0);
+                                }
+                                self.rebuild_player();
+                                self.window.as_ref().unwrap().request_redraw();
+                            }
                         }
                     }
                 } else if let (Some(track_idx), Some(clip_idx)) = (self.selected_track, self.selected_clip) {
